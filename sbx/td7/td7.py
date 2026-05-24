@@ -4,8 +4,9 @@ TD7 (TD3+4 additions) algorithm implementation.
 TD7 combines TD3 with:
 1. SALE (State-Action Learned Embeddings) - learns joint state-action representations
 2. Value clipping - clips target Q-values to observed range
-3. LAP (Loss-Adjusted Prioritized) - uses Huber loss for critic
-4. Hard target updates - copies networks every target_update_frequency steps
+3. LAP (Loss-Adjusted Prioritized) - prioritized replay with Huber loss
+4. Policy checkpoints - saves best-performing policy during training
+5. Hard target updates - copies networks every target_update_frequency steps
 
 Reference: https://arxiv.org/abs/2307.01254
 """
@@ -16,21 +17,33 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from gymnasium import spaces
-from stable_baselines3.common.buffers import ReplayBuffer
 from stable_baselines3.common.noise import ActionNoise
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
 
 from sbx.common.off_policy_algorithm import OffPolicyAlgorithmJax
 from sbx.common.type_aliases import ReplayBufferSamplesNp
 from sbx.td7.policies import TD7Policy
+from sbx.td7.replay_buffer import LAPReplayBuffer
 
 
-def huber_loss(x: jnp.ndarray, delta: float = 1.0) -> jnp.ndarray:
-    """Huber loss: quadratic for |x| < delta, linear otherwise.
+def lap_huber_loss(x: jnp.ndarray, min_priority: float = 1.0) -> jnp.ndarray:
+    """LAP-Huber loss: quadratic for |x| < min_priority, linear otherwise.
 
-    As used in LAP (Loss-Adjusted Prioritized) experience replay.
+    This is the loss function used in TD7's LAP (Loss-Adjusted Prioritized) replay.
+    Unlike standard Huber loss which uses a fixed delta, LAP-Huber uses min_priority
+    as the threshold. This naturally down-weights high-error samples without needing
+    importance sampling weights.
+
+    Formula:
+        L(x) = 0.5 * x^2           if |x| < min_priority
+        L(x) = min_priority * |x|  otherwise
+
+    :param x: TD errors (or any values to compute loss on)
+    :param min_priority: Threshold below which loss is quadratic (default: 1.0)
+    :return: Loss values with same shape as input
     """
-    return jnp.where(jnp.abs(x) < delta, 0.5 * x**2, delta * jnp.abs(x))
+    abs_x = jnp.abs(x)
+    return jnp.where(abs_x < min_priority, 0.5 * x**2, min_priority * abs_x)
 
 
 class TD7(OffPolicyAlgorithmJax):
@@ -40,7 +53,8 @@ class TD7(OffPolicyAlgorithmJax):
     - SALE encoder networks (state encoder f, state-action encoder g)
     - Fixed embeddings (use previous iteration's encoder for Q/policy updates)
     - Value clipping (clip target Q-values to observed min/max)
-    - Huber loss for critic (LAP)
+    - LAP prioritized replay (Huber loss + priority-based sampling)
+    - Policy checkpoints (save best-performing policy during training)
     - Hard target updates (every target_update_frequency steps, not soft EMA)
     """
 
@@ -69,12 +83,20 @@ class TD7(OffPolicyAlgorithmJax):
         target_policy_noise: float = 0.2,
         target_noise_clip: float = 0.5,
         action_noise: ActionNoise | None = None,
-        replay_buffer_class: type[ReplayBuffer] | None = None,
+        replay_buffer_class: type[LAPReplayBuffer] | None = None,
         replay_buffer_kwargs: dict[str, Any] | None = None,
         n_steps: int = 1,
         # TD7-specific hyperparameters
         target_update_freq: int = 250,  # Hard target update frequency
         zs_dim: int = 256,  # Embedding dimension
+        # LAP hyperparameters
+        alpha: float = 0.4,  # LAP prioritization exponent
+        min_priority: float = 1.0,  # LAP minimum priority
+        # Checkpoint hyperparameters
+        use_checkpointing: bool = True,  # Enable policy checkpointing
+        steps_before_checkpointing: int = 750_000,  # Steps before checkpointing activates
+        max_eps_when_checkpointing: int = 20,  # Max episodes per checkpoint assessment
+        reset_weight: float = 0.9,  # Weight for resetting best_min_return
         tensorboard_log: str | None = None,
         stats_window_size: int = 100,
         policy_kwargs: dict[str, Any] | None = None,
@@ -117,10 +139,34 @@ class TD7(OffPolicyAlgorithmJax):
         self.target_update_freq = target_update_freq
         self.zs_dim = zs_dim
 
+        # LAP hyperparameters
+        self.alpha = alpha
+        self.min_priority = min_priority
+
+        # Checkpoint hyperparameters
+        self.use_checkpointing = use_checkpointing
+        self.steps_before_checkpointing = steps_before_checkpointing
+        self.max_eps_when_checkpointing = max_eps_when_checkpointing
+        self.reset_weight = reset_weight
+
         if _init_setup_model:
             self._setup_model()
 
     def _setup_model(self) -> None:
+        # Override replay buffer class to use LAP buffer
+        if self.replay_buffer_class is None:  # type: ignore[has-type]
+            if isinstance(self.observation_space, spaces.Dict):
+                raise NotImplementedError(
+                    "LAPReplayBuffer does not support Dict observation spaces. " "Please use a different replay buffer class."
+                )
+            self.replay_buffer_class = LAPReplayBuffer  # type: ignore[assignment]
+
+        # Set LAP-specific replay buffer kwargs
+        if self.replay_buffer_kwargs is None:
+            self.replay_buffer_kwargs = {}
+        self.replay_buffer_kwargs.setdefault("alpha", self.alpha)
+        self.replay_buffer_kwargs.setdefault("min_priority", self.min_priority)
+
         super()._setup_model()
 
         if not hasattr(self, "policy") or self.policy is None:
@@ -156,6 +202,24 @@ class TD7(OffPolicyAlgorithmJax):
             self.target_value_clip_min = 0.0
             self.target_value_clip_max = 0.0
 
+            # Initialize checkpoint state
+            self._init_checkpoint_state()
+
+    def _init_checkpoint_state(self) -> None:
+        """Initialize checkpoint tracking state."""
+        # Checkpoint networks (actor + fixed_encoder)
+        self.checkpoint_actor_params = self.policy.actor_state.params
+        self.checkpoint_fixed_encoder_params = self.policy.encoder_state.params
+
+        # Checkpoint tracking
+        self._ckpt_eps_since_update = 0
+        self._ckpt_timesteps_since_update = 0
+        self._ckpt_min_return = float("inf")
+        self._ckpt_best_min_return = float("-inf")
+        self._ckpt_max_eps_before_update = 1  # Start with 1 episode per assessment
+        self._ckpt_checkpointing_enabled = False
+        self._last_ep_info_len = 0  # Track processed episodes in ep_info_buffer
+
     def learn(
         self,
         total_timesteps: int,
@@ -174,54 +238,164 @@ class TD7(OffPolicyAlgorithmJax):
             progress_bar=progress_bar,
         )
 
+    def _on_step(self) -> None:
+        """Called after each environment step. Handles checkpoint assessment logic."""
+        # Enable checkpointing after steps_before_checkpointing
+        if not self._ckpt_checkpointing_enabled and self.num_timesteps >= self.steps_before_checkpointing:
+            self._ckpt_checkpointing_enabled = True
+            self._ckpt_max_eps_before_update = self.max_eps_when_checkpointing
+            # Reset best_min_return with reset_weight to allow new policies to compete
+            self._ckpt_best_min_return *= self.reset_weight
+
+        # Check for completed episodes and update checkpoint state
+        if self.use_checkpointing and self._ckpt_checkpointing_enabled:
+            # Check ep_info_buffer for completed episodes
+            # ep_info_buffer entries have format {"r": reward, "l": length, "t": time}
+            if self.ep_info_buffer is not None and len(self.ep_info_buffer) > 0:
+                # Only process the latest episode info (avoid re-processing)
+                while self._last_ep_info_len < len(self.ep_info_buffer):
+                    ep_info = self.ep_info_buffer[self._last_ep_info_len]
+                    episode_return = ep_info["r"]
+                    episode_length = ep_info["l"]
+                    self._update_checkpoint_on_episode_end(episode_return, episode_length)
+                    self._last_ep_info_len += 1
+
+    def _update_checkpoint_on_episode_end(self, episode_return: float, episode_length: int) -> None:
+        """Update checkpoint state when an episode ends.
+
+        This implements the checkpoint mechanism from the TD7 paper:
+        1. Track minimum return across episodes for current policy assessment
+        2. If min_return < best_min_return, stop assessment early (policy is worse)
+        3. If assessment completes and policy is better, save checkpoint
+
+        :param episode_return: Total return of the completed episode
+        :param episode_length: Number of timesteps in the episode
+        """
+        if not self.use_checkpointing:
+            return
+
+        self._ckpt_eps_since_update += 1
+        self._ckpt_timesteps_since_update += episode_length
+        self._ckpt_min_return = min(self._ckpt_min_return, episode_return)
+
+        # Early stopping: current policy is worse than checkpoint
+        if self._ckpt_min_return < self._ckpt_best_min_return:
+            self._reset_checkpoint_tracking()
+            return
+
+        # Assessment complete: policy is at least as good as checkpoint
+        if self._ckpt_eps_since_update >= self._ckpt_max_eps_before_update:
+            # Save checkpoint
+            self._ckpt_best_min_return = self._ckpt_min_return
+            self.checkpoint_actor_params = self.policy.actor_state.params
+            self.checkpoint_fixed_encoder_params = self.fixed_encoder_params
+            self._reset_checkpoint_tracking()
+
+    def _reset_checkpoint_tracking(self) -> None:
+        """Reset checkpoint tracking variables after an assessment is complete."""
+        self._ckpt_eps_since_update = 0
+        self._ckpt_timesteps_since_update = 0
+        self._ckpt_min_return = float("inf")
+
+    def predict(
+        self,
+        observation: np.ndarray | dict[str, np.ndarray],
+        state: tuple[Any, ...] | None = None,
+        episode_start: np.ndarray | None = None,
+        deterministic: bool = False,
+    ) -> tuple[np.ndarray, tuple[Any, ...] | None]:
+        """Predict action using checkpoint policy if checkpointing is enabled and in eval mode.
+
+        During evaluation (deterministic=True), uses the checkpoint policy if available.
+        During training (deterministic=False), uses the current policy.
+        """
+        # Use checkpoint policy for evaluation if checkpointing is enabled
+        if deterministic and self.use_checkpointing and self._ckpt_checkpointing_enabled:
+            return self._predict_with_checkpoint(observation, state, episode_start)
+
+        return super().predict(observation, state, episode_start, deterministic)
+
+    def _predict_with_checkpoint(
+        self,
+        observation: np.ndarray | dict[str, np.ndarray],
+        state: tuple[Any, ...] | None = None,
+        episode_start: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, tuple[Any, ...] | None]:
+        """Predict action using checkpoint actor and fixed encoder."""
+        if isinstance(observation, dict):
+            # Flatten dict observations
+            obs_array = np.concatenate([observation[key] for key in sorted(observation.keys())], axis=-1)
+        else:
+            obs_array = observation
+
+        if not isinstance(obs_array, np.ndarray):
+            obs_array = np.array(obs_array)
+
+        # Add batch dimension if needed
+        if obs_array.ndim == len(self.observation_space.shape):  # type: ignore[attr-defined, arg-type]
+            obs_array = obs_array[np.newaxis, ...]
+
+        # Use checkpoint fixed encoder for zs
+        zs = self.state_encoder.apply(
+            {"params": self.checkpoint_fixed_encoder_params["state_encoder"]},
+            obs_array,
+        )
+        # Use checkpoint actor
+        action = self.policy.actor.apply(
+            self.checkpoint_actor_params,
+            obs_array,
+            zs,
+        )
+        action = np.array(action)
+
+        # Remove batch dimension if needed
+        if action.shape[0] == 1:
+            action = action.squeeze(0)
+
+        # Clip to action space
+        action = np.clip(action, self.action_space.low, self.action_space.high)
+
+        return action, state
+
     def train(self, gradient_steps: int, batch_size: int) -> None:
         assert self.replay_buffer is not None
 
         # Maybe reset the parameters/optimizers fully
         self._maybe_reset_params()
 
-        # Sample all at once for efficiency
-        data = self.replay_buffer.sample(batch_size * gradient_steps, env=self._vec_normalize_env)
-
-        if isinstance(data.observations, dict):
-            keys = list(self.observation_space.keys())  # type: ignore[attr-defined]
-            obs = np.concatenate([data.observations[key].numpy() for key in keys], axis=1)
-            next_obs = np.concatenate([data.next_observations[key].numpy() for key in keys], axis=1)
-        else:
-            obs = data.observations.numpy()
-            next_obs = data.next_observations.numpy()
-
-        if data.discounts is None:
-            discounts = np.full((batch_size * gradient_steps,), self.gamma, dtype=np.float32)
-        else:
-            discounts = data.discounts.numpy().flatten()
-
-        # Convert to numpy
-        data = ReplayBufferSamplesNp(  # type: ignore[assignment]
-            obs,
-            data.actions.numpy(),
-            next_obs,
-            data.dones.numpy().flatten(),
-            data.rewards.numpy().flatten(),
-            discounts,
-        )
-
-        # Run training steps using JIT-compiled update functions
+        # Run training steps
         total_encoder_loss = 0.0
         total_actor_loss = 0.0
         total_qf_loss = 0.0
         n_actor_updates = 0
 
         for i in range(gradient_steps):
-            start = i * batch_size
-            end = start + batch_size
+            # Sample from LAP replay buffer per gradient step
+            # This is necessary because we need to update priorities after each step
+            replay_data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)
 
-            batch_obs = data.observations[start:end]
-            batch_actions = data.actions[start:end]
-            batch_next_obs = data.next_observations[start:end]
-            batch_rewards = data.rewards[start:end]
-            batch_dones = data.dones[start:end]
-            batch_discounts = data.discounts[start:end]  # type: ignore[index]
+            if isinstance(replay_data.observations, dict):
+                keys = list(self.observation_space.keys())  # type: ignore[attr-defined]
+                obs = np.concatenate([replay_data.observations[key].numpy() for key in keys], axis=1)
+                next_obs = np.concatenate([replay_data.next_observations[key].numpy() for key in keys], axis=1)
+            else:
+                obs = replay_data.observations.numpy()
+                next_obs = replay_data.next_observations.numpy()
+
+            if replay_data.discounts is None:
+                discounts = np.full((batch_size,), self.gamma, dtype=np.float32)
+            else:
+                discounts = replay_data.discounts.numpy().flatten()
+
+            # Convert to numpy arrays for JAX
+            data = ReplayBufferSamplesNp(  # type: ignore[assignment]
+                obs,
+                replay_data.actions.numpy(),
+                next_obs,
+                replay_data.dones.numpy().flatten(),
+                replay_data.rewards.numpy().flatten(),
+                discounts,
+            )
 
             self.key, _enc_key, noise_key = jax.random.split(self.key, 3)
 
@@ -230,9 +404,9 @@ class TD7(OffPolicyAlgorithmJax):
             # ============================
             self.policy.encoder_state, encoder_loss_value = self._update_encoder(
                 self.policy.encoder_state,
-                batch_obs,
-                batch_next_obs,
-                batch_actions,
+                data.observations,
+                data.next_observations,
+                data.actions,
             )
 
             # ============================
@@ -243,17 +417,18 @@ class TD7(OffPolicyAlgorithmJax):
                 qf_loss_value,
                 self.value_clip_min,
                 self.value_clip_max,
+                td_errors,
             ) = self._update_critic(
                 self.policy.actor_state,
                 self.policy.qf_state,
                 self.fixed_encoder_params,
                 self.fixed_encoder_target_params,
-                batch_obs,
-                batch_actions,
-                batch_next_obs,
-                batch_rewards,
-                batch_dones,
-                batch_discounts,
+                data.observations,
+                data.actions,
+                data.next_observations,
+                data.rewards,
+                data.dones,
+                data.discounts,
                 self.target_policy_noise,
                 self.target_noise_clip,
                 self.value_clip_min,
@@ -263,6 +438,13 @@ class TD7(OffPolicyAlgorithmJax):
                 noise_key,
             )
 
+            # Update LAP priorities after each gradient step
+            if isinstance(self.replay_buffer, LAPReplayBuffer):
+                # td_errors shape: (n_critics, batch_size, 1) -> squeeze to (n_critics, batch_size)
+                td_errors_np = np.array(td_errors).squeeze(-1)  # (n_critics, batch_size)
+                # Transpose to (batch_size, n_critics) for update_priorities
+                self.replay_buffer.update_priorities(td_errors_np.T)
+
             # ============================
             # 3. Update Actor (delayed)
             # ============================
@@ -271,7 +453,7 @@ class TD7(OffPolicyAlgorithmJax):
                     self.policy.actor_state,
                     self.policy.qf_state,
                     self.fixed_encoder_params,
-                    batch_obs,
+                    data.observations,
                 )
                 total_actor_loss += actor_loss_value
                 n_actor_updates += 1
@@ -304,6 +486,7 @@ class TD7(OffPolicyAlgorithmJax):
         - Target fixed encoder <- fixed encoder (hard copy)
         - Fixed encoder <- current encoder (hard copy)
         - Value clipping bounds are updated
+        - LAP max_priority is reset
         """
         # Hard copy target networks
         self.policy.qf_state = self.policy.qf_state.replace(target_params=self.policy.qf_state.params)
@@ -322,6 +505,10 @@ class TD7(OffPolicyAlgorithmJax):
         # Reset the running min/max for next interval
         self.value_clip_min = float("inf")
         self.value_clip_max = float("-inf")
+
+        # Reset LAP max_priority after target update (per TD7 paper)
+        if isinstance(self.replay_buffer, LAPReplayBuffer):
+            self.replay_buffer.reset_max_priority()
 
     def _update_encoder(self, encoder_state, obs, next_obs, actions):
         """Update encoder networks: L(f, g) = ||g(f(s), a) - sg(f(s'))||^2"""
@@ -356,7 +543,11 @@ class TD7(OffPolicyAlgorithmJax):
         target_value_clip_max,
         key,
     ):
-        """Update critic with value clipping and Huber loss."""
+        """Update critic with value clipping and LAP-Huber loss.
+
+        Returns (qf_state, qf_loss_value, value_clip_min, value_clip_max, td_errors).
+        td_errors is shape (batch_size, n_critics) for priority updates.
+        """
         # Compute target Q-values using fixed target encoder
         fixed_target_zs = self.state_encoder.apply({"params": fixed_encoder_target_params["state_encoder"]}, next_obs)
 
@@ -400,18 +591,18 @@ class TD7(OffPolicyAlgorithmJax):
             actions,
         )
 
-        # Critic loss: Huber loss (LAP)
+        # Critic loss: LAP-Huber loss
         def critic_loss_fn(params):
             current_q_values = qf_state.apply_fn(params, obs, actions, fixed_zsa, fixed_zs)
             td_errors = current_q_values - target_q_values
-            # Huber loss with delta=1.0 (LAP)
-            per_critic_loss = huber_loss(td_errors, delta=1.0).mean(axis=1)
-            return per_critic_loss.sum()
+            # LAP-Huber loss: quadratic for |x| < min_priority, linear otherwise
+            per_critic_loss = lap_huber_loss(td_errors, min_priority=self.min_priority).mean(axis=1)
+            return per_critic_loss.sum(), td_errors
 
-        qf_loss_value, grads = jax.value_and_grad(critic_loss_fn)(qf_state.params)
+        (qf_loss_value, td_errors), grads = jax.value_and_grad(critic_loss_fn, has_aux=True)(qf_state.params)
         qf_state = qf_state.apply_gradients(grads=grads)
 
-        return qf_state, qf_loss_value, value_clip_min, value_clip_max
+        return qf_state, qf_loss_value, value_clip_min, value_clip_max, td_errors
 
     def _update_actor(self, actor_state, qf_state, fixed_encoder_params, obs):
         """Update actor using fixed encoder embeddings."""
