@@ -368,10 +368,15 @@ class TD7Policy(BaseJaxPolicy):
         return actor_state.apply_fn(actor_state.params, observations, zs)
 
     def _predict(self, observation: np.ndarray, deterministic: bool = True) -> np.ndarray:  # type: ignore[override]
-        # Use the current encoder for action selection
-        # (During training, the fixed encoder is used, but for _predict we use current)
+        # Use the fixed encoder for action selection (per TD7 paper: SALE uses
+        # fixed embeddings from the previous iteration for data collection).
+        # Fall back to current encoder if fixed_encoder_params is not yet set
+        # (e.g., during initial setup before _setup_model syncs it).
+        params = getattr(self, "fixed_encoder_params", None)
+        if params is None:
+            params = self.encoder_state.params
         zs = self.state_encoder.apply(
-            {"params": self.encoder_state.params["state_encoder"]},
+            {"params": params["state_encoder"]},
             observation,
         )
         return TD7Policy.select_action(self.actor_state, observation, zs)

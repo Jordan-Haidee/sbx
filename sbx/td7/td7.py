@@ -196,6 +196,10 @@ class TD7(OffPolicyAlgorithmJax):
             self.fixed_encoder_params = self.policy.encoder_state.params
             self.fixed_encoder_target_params = self.policy.encoder_state.params
 
+            # Sync fixed_encoder_params to policy so _predict() uses fixed encoder
+            # for data collection (per TD7 paper: SALE uses fixed embeddings)
+            self.policy.fixed_encoder_params = self.fixed_encoder_params
+
             # Initialize value clipping bounds
             self.value_clip_min = float("inf")
             self.value_clip_max = float("-inf")
@@ -206,7 +210,13 @@ class TD7(OffPolicyAlgorithmJax):
             self._init_checkpoint_state()
 
     def _init_checkpoint_state(self) -> None:
-        """Initialize checkpoint tracking state."""
+        """Initialize checkpoint tracking state.
+
+        Implements the batch training checkpoint mechanism from the TD7 paper:
+        During assessment periods, training is paused and gradient steps are
+        accumulated. After assessment completes, all accumulated steps are
+        trained at once, matching the original TD7 implementation.
+        """
         # Checkpoint networks (actor + fixed_encoder)
         self.checkpoint_actor_params = self.policy.actor_state.params
         self.checkpoint_fixed_encoder_params = self.policy.encoder_state.params
@@ -219,6 +229,10 @@ class TD7(OffPolicyAlgorithmJax):
         self._ckpt_max_eps_before_update = 1  # Start with 1 episode per assessment
         self._ckpt_checkpointing_enabled = False
         self._last_ep_info_len = 0  # Track processed episodes in ep_info_buffer
+
+        # Batch training: pause training during assessment, accumulate steps
+        self._ckpt_training_paused = False
+        self._ckpt_accumulated_gradient_steps = 0
 
     def learn(
         self,
@@ -246,6 +260,9 @@ class TD7(OffPolicyAlgorithmJax):
             self._ckpt_max_eps_before_update = self.max_eps_when_checkpointing
             # Reset best_min_return with reset_weight to allow new policies to compete
             self._ckpt_best_min_return *= self.reset_weight
+            # Pause training during assessment (per original TD7 implementation:
+            # training is deferred during assessment, then batch-executed after)
+            self._ckpt_training_paused = True
 
         # Check for completed episodes and update checkpoint state
         if self.use_checkpointing and self._ckpt_checkpointing_enabled:
@@ -268,6 +285,9 @@ class TD7(OffPolicyAlgorithmJax):
         2. If min_return < best_min_return, stop assessment early (policy is worse)
         3. If assessment completes and policy is better, save checkpoint
 
+        Per the original TD7 implementation, training is deferred during assessment
+        and batch-executed after assessment completes.
+
         :param episode_return: Total return of the completed episode
         :param episode_length: Number of timesteps in the episode
         """
@@ -280,7 +300,10 @@ class TD7(OffPolicyAlgorithmJax):
 
         # Early stopping: current policy is worse than checkpoint
         if self._ckpt_min_return < self._ckpt_best_min_return:
+            self._resume_batch_training()
             self._reset_checkpoint_tracking()
+            # Start new assessment period: pause training again
+            self._ckpt_training_paused = True
             return
 
         # Assessment complete: policy is at least as good as checkpoint
@@ -289,7 +312,25 @@ class TD7(OffPolicyAlgorithmJax):
             self._ckpt_best_min_return = self._ckpt_min_return
             self.checkpoint_actor_params = self.policy.actor_state.params
             self.checkpoint_fixed_encoder_params = self.fixed_encoder_params
+            self._resume_batch_training()
             self._reset_checkpoint_tracking()
+            # Start new assessment period: pause training again
+            self._ckpt_training_paused = True
+
+    def _resume_batch_training(self) -> None:
+        """Resume training by executing all accumulated gradient steps at once.
+
+        Per the original TD7 implementation, training is deferred during assessment
+        periods. When an assessment completes (either early stop or max episodes),
+        all accumulated gradient steps are executed in batch before starting a new
+        assessment period.
+        """
+        if self._ckpt_accumulated_gradient_steps > 0:
+            # Temporarily unpause training
+            self._ckpt_training_paused = False
+            accumulated = self._ckpt_accumulated_gradient_steps
+            self._ckpt_accumulated_gradient_steps = 0
+            self.train(gradient_steps=accumulated, batch_size=self.batch_size)
 
     def _reset_checkpoint_tracking(self) -> None:
         """Reset checkpoint tracking variables after an assessment is complete."""
@@ -360,6 +401,13 @@ class TD7(OffPolicyAlgorithmJax):
     def train(self, gradient_steps: int, batch_size: int) -> None:
         assert self.replay_buffer is not None
 
+        # Checkpoint batch training: if training is paused during assessment,
+        # accumulate gradient steps and skip training. Steps will be executed
+        # in batch when the assessment completes (per original TD7 implementation).
+        if self._ckpt_training_paused:
+            self._ckpt_accumulated_gradient_steps += gradient_steps
+            return
+
         # Maybe reset the parameters/optimizers fully
         self._maybe_reset_params()
 
@@ -369,7 +417,7 @@ class TD7(OffPolicyAlgorithmJax):
         total_qf_loss = 0.0
         n_actor_updates = 0
 
-        for i in range(gradient_steps):
+        for _ in range(gradient_steps):
             # Sample from LAP replay buffer per gradient step
             # This is necessary because we need to update priorities after each step
             replay_data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)
@@ -448,7 +496,8 @@ class TD7(OffPolicyAlgorithmJax):
             # ============================
             # 3. Update Actor (delayed)
             # ============================
-            if (self._n_updates + i + 1) % self.policy_delay == 0:
+            self._n_updates += 1
+            if self._n_updates % self.policy_delay == 0:
                 self.policy.actor_state, actor_loss_value = self._update_actor(
                     self.policy.actor_state,
                     self.policy.qf_state,
@@ -461,11 +510,9 @@ class TD7(OffPolicyAlgorithmJax):
             total_encoder_loss += encoder_loss_value
             total_qf_loss += qf_loss_value
 
-        self._n_updates += gradient_steps
-
-        # Hard target update: every target_update_freq steps
-        if self._n_updates % self.target_update_freq == 0:
-            self._do_target_update()
+            # Hard target update: every target_update_freq steps
+            if self._n_updates % self.target_update_freq == 0:
+                self._do_target_update()
 
         # Log losses
         avg_encoder_loss = total_encoder_loss / gradient_steps
@@ -498,13 +545,14 @@ class TD7(OffPolicyAlgorithmJax):
         self.fixed_encoder_target_params = self.fixed_encoder_params
         self.fixed_encoder_params = self.policy.encoder_state.params
 
+        # Sync fixed_encoder_params to policy so _predict() uses fixed encoder
+        self.policy.fixed_encoder_params = self.fixed_encoder_params
+
         # Update value clipping bounds for target computation
+        # Per original TD7 implementation: bounds accumulate over the entire
+        # training run (never reset), giving a progressively wider clip range.
         self.target_value_clip_min = self.value_clip_min
         self.target_value_clip_max = self.value_clip_max
-
-        # Reset the running min/max for next interval
-        self.value_clip_min = float("inf")
-        self.value_clip_max = float("-inf")
 
         # Reset LAP max_priority after target update (per TD7 paper)
         if isinstance(self.replay_buffer, LAPReplayBuffer):
