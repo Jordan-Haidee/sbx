@@ -47,6 +47,20 @@ def test_td7_replay_buffer_priority_update_changes_max_priority():
     assert buffer.max_priority >= 5.0
 
 
+def test_td7_actor_loss_uses_mean_across_critics():
+    q_values = jnp.array(
+        [
+            [[1.0], [5.0]],
+            [[3.0], [7.0]],
+        ],
+        dtype=jnp.float32,
+    )
+
+    loss = TD7._actor_loss_from_q_values(q_values)
+
+    assert loss == pytest.approx(-4.0)
+
+
 def test_td7_policy_builds_and_predicts_shapes():
     policy = TD7Policy(
         spaces.Box(-1.0, 1.0, shape=(3,)),
@@ -82,6 +96,15 @@ def test_td7_train_step_updates_key_and_training_counters():
     assert model._n_updates > 0
 
 
+def test_td7_defaults_match_official_hyperparameters():
+    model = TD7("MlpPolicy", TinyEpisodeEnv())
+
+    assert model.learning_starts == 25_000
+    assert model.gamma == pytest.approx(0.99)
+    assert model.prioritized_replay_alpha == pytest.approx(0.4)
+    assert model.replay_buffer.alpha == pytest.approx(0.4)
+
+
 class TinyEpisodeEnv(gym.Env):
     def __init__(self):
         self.observation_space = gym.spaces.Box(-1.0, 1.0, shape=(3,))
@@ -114,6 +137,33 @@ class CountingCallback(BaseCallback):
 
     def _on_training_end(self) -> None:
         self.training_ended = True
+
+
+def test_td7_target_update_resets_replay_buffer_max_priority():
+    model = TD7(
+        "MlpPolicy",
+        TinyEpisodeEnv(),
+        learning_starts=0,
+        buffer_size=128,
+        batch_size=8,
+        target_update_interval=1,
+    )
+    env = model.get_env().envs[0]
+    obs = env.reset()[0]
+    for _ in range(32):
+        action = env.action_space.sample()
+        next_obs, reward, terminated, truncated, _ = env.step(action)
+        model.replay_buffer.add(obs, action, next_obs, reward, terminated or truncated)
+        obs = next_obs if not (terminated or truncated) else env.reset()[0]
+
+    model.replay_buffer.priorities[: model.replay_buffer.size] = 1.0
+    model.replay_buffer.max_priority = 1_000_000.0
+
+    model._run_delayed_training_pulse(steps_to_train=1)
+
+    expected_max_priority = float(model.replay_buffer.priorities[: model.replay_buffer.size].max())
+    assert model.replay_buffer.max_priority == pytest.approx(expected_max_priority)
+    assert model.replay_buffer.max_priority < 1_000_000.0
 
 
 def test_td7_checkpoint_window_triggers_training_pulse():

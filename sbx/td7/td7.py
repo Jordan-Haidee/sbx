@@ -31,10 +31,10 @@ class TD7(OffPolicyAlgorithmJax):
         qf_learning_rate: float | None = None,
         encoder_learning_rate: float = 3e-4,
         buffer_size: int = 1_000_000,
-        learning_starts: int = 5_000,
+        learning_starts: int = 25_000,
         batch_size: int = 256,
         tau: float = 0.005,
-        gamma: float = 0.995,
+        gamma: float = 0.99,
         train_freq: int | tuple[int, str] = 1,
         gradient_steps: int = 1,
         policy_delay: int = 2,
@@ -45,7 +45,7 @@ class TD7(OffPolicyAlgorithmJax):
         steps_before_checkpointing: int = 750_000,
         checkpoint_max_episodes: int = 20,
         reset_weight: float = 0.9,
-        prioritized_replay_alpha: float = 0.6,
+        prioritized_replay_alpha: float = 0.4,
         min_priority: float = 1.0,
         train_chunk_size: int = 128,
         action_noise: ActionNoise | None = None,
@@ -380,6 +380,10 @@ class TD7(OffPolicyAlgorithmJax):
         return 0.5 * quadratic**2 + delta * linear
 
     @staticmethod
+    def _actor_loss_from_q_values(q_values: jax.Array) -> jax.Array:
+        return -jnp.mean(jnp.mean(q_values, axis=0))
+
+    @staticmethod
     @jax.jit
     def _train_single_step(
         actor_state,
@@ -466,7 +470,7 @@ class TD7(OffPolicyAlgorithmJax):
                     encode_action=True,
                 )
                 q_values = critic_state_.apply_fn(critic_state_.params, observations, actor_actions, fixed_zs, actor_zsa)
-                return -jnp.mean(jnp.min(q_values, axis=0))
+                return TD7._actor_loss_from_q_values(q_values)
 
             actor_loss, actor_grads = jax.value_and_grad(actor_loss_fn)(actor_state_.params)
             actor_state_ = actor_state_.apply_gradients(grads=actor_grads)
@@ -600,6 +604,8 @@ class TD7(OffPolicyAlgorithmJax):
                 self.key,
             )
             self.replay_buffer.update_priorities(sample.indices, np.asarray(priorities))
+            if (self._n_updates + 1) % self.target_update_interval == 0:
+                self.replay_buffer.reset_max_priority()
             self._n_updates += 1
             encoder_loss_value = float(encoder_loss)
             critic_loss_value = float(critic_loss)

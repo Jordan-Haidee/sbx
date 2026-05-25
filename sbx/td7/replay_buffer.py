@@ -20,7 +20,7 @@ class TD7ReplayBuffer:
         observation_dim: int,
         action_dim: int,
         batch_size: int,
-        alpha: float = 0.6,
+        alpha: float = 0.4,
     ) -> None:
         self.buffer_size = buffer_size
         self.batch_size = batch_size
