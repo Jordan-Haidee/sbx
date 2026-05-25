@@ -10,7 +10,7 @@ from stable_baselines3.common.noise import ActionNoise
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
 
 from sbx.common.off_policy_algorithm import OffPolicyAlgorithmJax
-from sbx.td7.policies import SimbaTD7Policy, TD7Policy
+from sbx.td7.policies import SimbaTD7Policy, SimbaV2TD7Policy, TD7Policy
 from sbx.td7.replay_buffer import TD7ReplayBuffer
 
 
@@ -18,6 +18,7 @@ class TD7(OffPolicyAlgorithmJax):
     policy_aliases: ClassVar[dict[str, type[TD7Policy]]] = {
         "MlpPolicy": TD7Policy,
         "SimbaPolicy": SimbaTD7Policy,
+        "SimbaV2Policy": SimbaV2TD7Policy,
         "MultiInputPolicy": TD7Policy,
     }
 
@@ -323,8 +324,12 @@ class TD7(OffPolicyAlgorithmJax):
             return self.policy.scale_action(scaled)
 
         if use_checkpoint and self.checkpoint_actor_params is not None and self.checkpoint_encoder_params is not None:
-            zs = self.policy.fixed_encoder_state.apply_fn(self.checkpoint_encoder_params, obs)
-            actions = self.policy.actor.apply(self.checkpoint_actor_params, obs, zs)
+            feature, zs = self.policy.fixed_encoder_state.apply_fn(
+                self.checkpoint_encoder_params,
+                obs,
+                return_feature=True,
+            )
+            actions = self.policy.actor.apply(self.checkpoint_actor_params, feature, zs)
         else:
             actions = self.policy.select_action(self.policy.actor_state, self.policy.fixed_encoder_state, obs)
 
@@ -421,8 +426,12 @@ class TD7(OffPolicyAlgorithmJax):
         encoder_loss, encoder_grads = jax.value_and_grad(encoder_loss_fn)(encoder_state.params)
         encoder_state = encoder_state.apply_gradients(grads=encoder_grads)
 
-        fixed_target_zs = fixed_encoder_target_state.apply_fn(fixed_encoder_target_state.params, next_observations)
-        next_actions = actor_state.apply_fn(actor_state.target_params, next_observations, fixed_target_zs)
+        next_feature, fixed_target_zs = fixed_encoder_target_state.apply_fn(
+            fixed_encoder_target_state.params,
+            next_observations,
+            return_feature=True,
+        )
+        next_actions = actor_state.apply_fn(actor_state.target_params, next_feature, fixed_target_zs)
         noise = jax.random.normal(noise_key, actions.shape) * target_policy_noise
         noise = jnp.clip(noise, -target_noise_clip, target_noise_clip)
         next_actions = jnp.clip(next_actions + noise, -1.0, 1.0)
@@ -434,7 +443,7 @@ class TD7(OffPolicyAlgorithmJax):
         )
         next_q = critic_state.apply_fn(
             critic_state.target_params,
-            next_observations,
+            next_feature,
             next_actions,
             fixed_target_zs,
             fixed_target_zsa,
@@ -446,11 +455,15 @@ class TD7(OffPolicyAlgorithmJax):
         running_min_value = jnp.minimum(running_min_value, jnp.min(target_q))
         running_max_value = jnp.maximum(running_max_value, jnp.max(target_q))
 
-        fixed_zs = fixed_encoder_state.apply_fn(fixed_encoder_state.params, observations)
+        feature, fixed_zs = fixed_encoder_state.apply_fn(
+            fixed_encoder_state.params,
+            observations,
+            return_feature=True,
+        )
         fixed_zsa = fixed_encoder_state.apply_fn(fixed_encoder_state.params, fixed_zs, actions, encode_action=True)
 
         def critic_loss_fn(params):
-            current_q = critic_state.apply_fn(params, observations, actions, fixed_zs, fixed_zsa).squeeze(-1)
+            current_q = critic_state.apply_fn(params, feature, actions, fixed_zs, fixed_zsa).squeeze(-1)
             td_errors = current_q - target_q[None, :]
             loss = jnp.mean(TD7._huber_loss(td_errors).sum(axis=0))
             priorities = jnp.maximum(jnp.max(jnp.abs(td_errors), axis=0), min_priority)
@@ -463,14 +476,14 @@ class TD7(OffPolicyAlgorithmJax):
             actor_state_, critic_state_, key_ = carry
 
             def actor_loss_fn(params):
-                actor_actions = actor_state_.apply_fn(params, observations, fixed_zs)
+                actor_actions = actor_state_.apply_fn(params, feature, fixed_zs)
                 actor_zsa = fixed_encoder_state.apply_fn(
                     fixed_encoder_state.params,
                     fixed_zs,
                     actor_actions,
                     encode_action=True,
                 )
-                q_values = critic_state_.apply_fn(critic_state_.params, observations, actor_actions, fixed_zs, actor_zsa)
+                q_values = critic_state_.apply_fn(critic_state_.params, feature, actor_actions, fixed_zs, actor_zsa)
                 return TD7._actor_loss_from_q_values(q_values)
 
             actor_loss, actor_grads = jax.value_and_grad(actor_loss_fn)(actor_state_.params)

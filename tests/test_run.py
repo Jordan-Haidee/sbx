@@ -9,7 +9,7 @@ from stable_baselines3.common.evaluation import evaluate_policy
 
 from sbx import DDPG, DQN, PPO, SAC, TD3, TQC, CrossQ, DroQ, TD7
 from sbx.sac.policies import SimbaV2SACPolicy
-from sbx.td3.policies import SimbaTD3Policy
+from sbx.td3.policies import SimbaTD3Policy, SimbaV2TD3Policy
 from sbx.tqc.policies import SimbaV2TQCPolicy
 
 
@@ -115,7 +115,19 @@ def test_tqc_simba_v2(tmp_path) -> None:
 
 @pytest.mark.parametrize(
     "model_class",
-    [SAC, TD3, DDPG, CrossQ, "SimbaSAC", "SimbaCrossQ", "SimbaTD3", "SimbaDDPG", "SimbaV2SAC"],
+    [
+        SAC,
+        TD3,
+        DDPG,
+        CrossQ,
+        "SimbaSAC",
+        "SimbaCrossQ",
+        "SimbaTD3",
+        "SimbaDDPG",
+        "SimbaV2SAC",
+        "SimbaV2TD3",
+        "SimbaV2DDPG",
+    ],
 )
 def test_sac_td3(tmp_path, model_class) -> None:
     policy = "MlpPolicy"
@@ -138,6 +150,14 @@ def test_sac_td3(tmp_path, model_class) -> None:
         net_kwargs = dict(net_arch=[64])
     elif model_class == "SimbaV2SAC":
         model_class = SAC
+        policy = "SimbaV2Policy"
+        net_kwargs = dict(net_arch=[64])
+    elif model_class == "SimbaV2TD3":
+        model_class = TD3
+        policy = "SimbaV2Policy"
+        net_kwargs = dict(net_arch=[64])
+    elif model_class == "SimbaV2DDPG":
+        model_class = DDPG
         policy = "SimbaV2Policy"
         net_kwargs = dict(net_arch=[64])
 
@@ -170,6 +190,24 @@ def test_sac_simba_v2_policy_uses_simba_v2_defaults() -> None:
     model = SAC("SimbaV2Policy", "Pendulum-v1", learning_starts=10, buffer_size=512, batch_size=32)
 
     assert isinstance(model.policy, SimbaV2SACPolicy)
+    assert model.policy.optimizer_class is optax.adamw
+    assert model.policy.net_arch_pi == [256, 256]
+    assert model.policy.net_arch_qf == [256, 256]
+
+
+def test_td3_simba_v2_policy_uses_simba_v2_defaults() -> None:
+    model = TD3("SimbaV2Policy", "Pendulum-v1", learning_starts=10, buffer_size=512, batch_size=32)
+
+    assert isinstance(model.policy, SimbaV2TD3Policy)
+    assert model.policy.optimizer_class is optax.adamw
+    assert model.policy.net_arch_pi == [256, 256]
+    assert model.policy.net_arch_qf == [256, 256]
+
+
+def test_ddpg_simba_v2_policy_uses_simba_v2_defaults() -> None:
+    model = DDPG("SimbaV2Policy", "Pendulum-v1", learning_starts=10, buffer_size=512, batch_size=32)
+
+    assert isinstance(model.policy, SimbaV2TD3Policy)
     assert model.policy.optimizer_class is optax.adamw
     assert model.policy.net_arch_pi == [256, 256]
     assert model.policy.net_arch_qf == [256, 256]

@@ -16,6 +16,11 @@ from sbx.td7.policies import (
     SimbaTD7Actor,
     SimbaTD7Policy,
     SimbaTD7TwinCritic,
+    SimbaV2TD7ActionEncoder,
+    SimbaV2TD7Actor,
+    SimbaV2TD7Policy,
+    SimbaV2TD7StateEncoder,
+    SimbaV2TD7TwinCritic,
     SimbaTD7StateEncoder,
     TD7Policy,
 )
@@ -97,6 +102,37 @@ def test_simba_td7_policy_builds_and_predicts_shapes():
     assert action.shape == (4, 1)
 
 
+def test_simba_v2_td7_policy_builds_and_predicts_shapes():
+    policy = SimbaV2TD7Policy(
+        spaces.Box(-1.0, 1.0, shape=(3,)),
+        spaces.Box(-1.0, 1.0, shape=(1,)),
+        ConstantSchedule(3e-4),
+    )
+    key = jax.random.PRNGKey(0)
+    key = policy.build(key, ConstantSchedule(3e-4), 3e-4, 3e-4)
+    obs = jnp.zeros((4, 3), dtype=jnp.float32)
+    action = policy.select_action(policy.actor_state, policy.fixed_encoder_state, obs)
+
+    assert policy.optimizer_class is optax.adamw
+    assert action.shape == (4, 1)
+
+
+def test_simba_v2_td7_policy_uses_explicit_preprocess_and_baseline_param_tree():
+    policy = SimbaV2TD7Policy(
+        spaces.Box(-1.0, 1.0, shape=(3,)),
+        spaces.Box(-1.0, 1.0, shape=(1,)),
+        ConstantSchedule(3e-4),
+    )
+    key = jax.random.PRNGKey(0)
+    policy.build(key, ConstantSchedule(3e-4), 3e-4, 3e-4)
+
+    assert hasattr(policy, "preprocess")
+    assert "preprocess" in policy.encoder_state.params
+    assert "SimbaV2Head_0" in policy.actor_state.params["params"]
+    assert "VmapSimbaV2TD7SingleCritic_0" in policy.critic_state.params["params"]
+    assert "SimbaV2Head_0" in policy.critic_state.params["params"]["VmapSimbaV2TD7SingleCritic_0"]
+
+
 def test_td7_exposes_simba_policy_alias():
     model = TD7("SimbaPolicy", "Pendulum-v1", learning_starts=10, buffer_size=512, batch_size=32)
 
@@ -105,6 +141,16 @@ def test_td7_exposes_simba_policy_alias():
     assert isinstance(model.policy.action_encoder, SimbaTD7ActionEncoder)
     assert isinstance(model.policy.actor, SimbaTD7Actor)
     assert isinstance(model.policy.critic, SimbaTD7TwinCritic)
+
+
+def test_td7_exposes_simba_v2_policy_alias():
+    model = TD7("SimbaV2Policy", "Pendulum-v1", learning_starts=10, buffer_size=512, batch_size=32)
+
+    assert isinstance(model.policy, SimbaV2TD7Policy)
+    assert isinstance(model.policy.state_encoder, SimbaV2TD7StateEncoder)
+    assert isinstance(model.policy.action_encoder, SimbaV2TD7ActionEncoder)
+    assert isinstance(model.policy.actor, SimbaV2TD7Actor)
+    assert isinstance(model.policy.critic, SimbaV2TD7TwinCritic)
 
 
 def test_td7_train_step_updates_key_and_training_counters():
