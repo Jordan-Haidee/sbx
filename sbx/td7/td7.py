@@ -10,13 +10,14 @@ from stable_baselines3.common.noise import ActionNoise
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
 
 from sbx.common.off_policy_algorithm import OffPolicyAlgorithmJax
-from sbx.td7.policies import TD7Policy
+from sbx.td7.policies import SimbaTD7Policy, TD7Policy
 from sbx.td7.replay_buffer import TD7ReplayBuffer
 
 
 class TD7(OffPolicyAlgorithmJax):
     policy_aliases: ClassVar[dict[str, type[TD7Policy]]] = {
         "MlpPolicy": TD7Policy,
+        "SimbaPolicy": SimbaTD7Policy,
         "MultiInputPolicy": TD7Policy,
     }
 

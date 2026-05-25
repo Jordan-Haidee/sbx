@@ -2,6 +2,7 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 import gymnasium as gym
+import optax
 import pytest
 from gymnasium import spaces
 from stable_baselines3.common.callbacks import BaseCallback
@@ -10,7 +11,7 @@ from stable_baselines3.common.utils import ConstantSchedule
 
 from sbx import TD7
 from sbx.td7.replay_buffer import TD7ReplayBuffer
-from sbx.td7.policies import TD7Policy
+from sbx.td7.policies import SimbaTD7Policy, TD7Policy
 
 
 def test_td7_replay_buffer_add_and_sample():
@@ -72,6 +73,27 @@ def test_td7_policy_builds_and_predicts_shapes():
     obs = jnp.zeros((4, 3), dtype=jnp.float32)
     action = policy.select_action(policy.actor_state, policy.fixed_encoder_state, obs)
     assert action.shape == (4, 1)
+
+
+def test_simba_td7_policy_builds_and_predicts_shapes():
+    policy = SimbaTD7Policy(
+        spaces.Box(-1.0, 1.0, shape=(3,)),
+        spaces.Box(-1.0, 1.0, shape=(1,)),
+        ConstantSchedule(3e-4),
+    )
+    key = jax.random.PRNGKey(0)
+    key = policy.build(key, ConstantSchedule(3e-4), 3e-4, 3e-4)
+    obs = jnp.zeros((4, 3), dtype=jnp.float32)
+    action = policy.select_action(policy.actor_state, policy.fixed_encoder_state, obs)
+
+    assert policy.optimizer_class is optax.adamw
+    assert action.shape == (4, 1)
+
+
+def test_td7_exposes_simba_policy_alias():
+    model = TD7("SimbaPolicy", "Pendulum-v1", learning_starts=10, buffer_size=512, batch_size=32)
+
+    assert isinstance(model.policy, SimbaTD7Policy)
 
 
 def test_td7_train_step_updates_key_and_training_counters():

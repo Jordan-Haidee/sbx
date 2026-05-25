@@ -1,5 +1,6 @@
 import flax.linen as nn
 import numpy as np
+import optax
 import pytest
 from stable_baselines3 import HerReplayBuffer
 from stable_baselines3.common.env_util import make_vec_env
@@ -7,6 +8,7 @@ from stable_baselines3.common.envs import BitFlippingEnv
 from stable_baselines3.common.evaluation import evaluate_policy
 
 from sbx import DDPG, DQN, PPO, SAC, TD3, TQC, CrossQ, DroQ, TD7
+from sbx.td3.policies import SimbaTD3Policy
 
 
 def test_td7_is_exported():
@@ -96,7 +98,7 @@ def test_tqc(tmp_path) -> None:
     check_save_load(model, TQC, tmp_path)
 
 
-@pytest.mark.parametrize("model_class", [SAC, TD3, DDPG, CrossQ, "SimbaSAC", "SimbaCrossQ"])
+@pytest.mark.parametrize("model_class", [SAC, TD3, DDPG, CrossQ, "SimbaSAC", "SimbaCrossQ", "SimbaTD3", "SimbaDDPG"])
 def test_sac_td3(tmp_path, model_class) -> None:
     policy = "MlpPolicy"
     net_kwargs = {}
@@ -106,6 +108,14 @@ def test_sac_td3(tmp_path, model_class) -> None:
         net_kwargs = dict(net_arch=[64])
     elif model_class == "SimbaCrossQ":
         model_class = CrossQ
+        policy = "SimbaPolicy"
+        net_kwargs = dict(net_arch=[64])
+    elif model_class == "SimbaTD3":
+        model_class = TD3
+        policy = "SimbaPolicy"
+        net_kwargs = dict(net_arch=[64])
+    elif model_class == "SimbaDDPG":
+        model_class = DDPG
         policy = "SimbaPolicy"
         net_kwargs = dict(net_arch=[64])
 
@@ -123,6 +133,15 @@ def test_sac_td3(tmp_path, model_class) -> None:
     # See issue #45
     assert not np.allclose(key_before_learn, model.key)
     check_save_load(model, model_class, tmp_path)
+
+
+def test_td3_simba_policy_uses_simba_defaults() -> None:
+    model = TD3("SimbaPolicy", "Pendulum-v1", learning_starts=10, buffer_size=512, batch_size=32)
+
+    assert isinstance(model.policy, SimbaTD3Policy)
+    assert model.policy.optimizer_class is optax.adamw
+    assert model.policy.net_arch_pi == [256, 256]
+    assert model.policy.net_arch_qf == [256, 256]
 
 
 @pytest.mark.parametrize("model_class", [SAC, CrossQ])

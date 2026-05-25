@@ -4,13 +4,14 @@ from stable_baselines3.common.buffers import ReplayBuffer
 from stable_baselines3.common.noise import ActionNoise
 from stable_baselines3.common.type_aliases import GymEnv, Schedule
 
-from sbx.td3.policies import TD3Policy
+from sbx.td3.policies import SimbaTD3Policy, TD3Policy
 from sbx.td3.td3 import TD3
 
 
 class DDPG(TD3):
     policy_aliases: ClassVar[dict[str, type[TD3Policy]]] = {
         "MlpPolicy": TD3Policy,
+        "SimbaPolicy": SimbaTD3Policy,
     }
 
     def __init__(

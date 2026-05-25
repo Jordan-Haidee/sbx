@@ -13,12 +13,13 @@ from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedul
 
 from sbx.common.off_policy_algorithm import OffPolicyAlgorithmJax
 from sbx.common.type_aliases import ReplayBufferSamplesNp, RLTrainState
-from sbx.td3.policies import TD3Policy
+from sbx.td3.policies import SimbaTD3Policy, TD3Policy
 
 
 class TD3(OffPolicyAlgorithmJax):
     policy_aliases: ClassVar[dict[str, type[TD3Policy]]] = {  # type: ignore[assignment]
         "MlpPolicy": TD3Policy,
+        "SimbaPolicy": SimbaTD3Policy,
         # Minimal dict support using flatten()
         "MultiInputPolicy": TD3Policy,
     }
