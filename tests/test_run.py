@@ -8,7 +8,9 @@ from stable_baselines3.common.envs import BitFlippingEnv
 from stable_baselines3.common.evaluation import evaluate_policy
 
 from sbx import DDPG, DQN, PPO, SAC, TD3, TQC, CrossQ, DroQ, TD7
+from sbx.sac.policies import SimbaV2SACPolicy
 from sbx.td3.policies import SimbaTD3Policy
+from sbx.tqc.policies import SimbaV2TQCPolicy
 
 
 def test_td7_is_exported():
@@ -98,7 +100,23 @@ def test_tqc(tmp_path) -> None:
     check_save_load(model, TQC, tmp_path)
 
 
-@pytest.mark.parametrize("model_class", [SAC, TD3, DDPG, CrossQ, "SimbaSAC", "SimbaCrossQ", "SimbaTD3", "SimbaDDPG"])
+def test_tqc_simba_v2(tmp_path) -> None:
+    model = TQC(
+        "SimbaV2Policy",
+        "Pendulum-v1",
+        learning_starts=50,
+        gradient_steps=1,
+        learning_rate=1e-3,
+        policy_kwargs=dict(net_arch=[64]),
+    )
+    model.learn(110)
+    check_save_load(model, TQC, tmp_path)
+
+
+@pytest.mark.parametrize(
+    "model_class",
+    [SAC, TD3, DDPG, CrossQ, "SimbaSAC", "SimbaCrossQ", "SimbaTD3", "SimbaDDPG", "SimbaV2SAC"],
+)
 def test_sac_td3(tmp_path, model_class) -> None:
     policy = "MlpPolicy"
     net_kwargs = {}
@@ -117,6 +135,10 @@ def test_sac_td3(tmp_path, model_class) -> None:
     elif model_class == "SimbaDDPG":
         model_class = DDPG
         policy = "SimbaPolicy"
+        net_kwargs = dict(net_arch=[64])
+    elif model_class == "SimbaV2SAC":
+        model_class = SAC
+        policy = "SimbaV2Policy"
         net_kwargs = dict(net_arch=[64])
 
     model = model_class(
@@ -139,6 +161,24 @@ def test_td3_simba_policy_uses_simba_defaults() -> None:
     model = TD3("SimbaPolicy", "Pendulum-v1", learning_starts=10, buffer_size=512, batch_size=32)
 
     assert isinstance(model.policy, SimbaTD3Policy)
+    assert model.policy.optimizer_class is optax.adamw
+    assert model.policy.net_arch_pi == [256, 256]
+    assert model.policy.net_arch_qf == [256, 256]
+
+
+def test_sac_simba_v2_policy_uses_simba_v2_defaults() -> None:
+    model = SAC("SimbaV2Policy", "Pendulum-v1", learning_starts=10, buffer_size=512, batch_size=32)
+
+    assert isinstance(model.policy, SimbaV2SACPolicy)
+    assert model.policy.optimizer_class is optax.adamw
+    assert model.policy.net_arch_pi == [256, 256]
+    assert model.policy.net_arch_qf == [256, 256]
+
+
+def test_tqc_simba_v2_policy_uses_simba_v2_defaults() -> None:
+    model = TQC("SimbaV2Policy", "Pendulum-v1", learning_starts=10, buffer_size=512, batch_size=32)
+
+    assert isinstance(model.policy, SimbaV2TQCPolicy)
     assert model.policy.optimizer_class is optax.adamw
     assert model.policy.net_arch_pi == [256, 256]
     assert model.policy.net_arch_qf == [256, 256]
