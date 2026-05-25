@@ -90,6 +90,40 @@ class TD7TwinCritic(nn.Module):
         return vmap_critic(hidden_dim=self.hidden_dim, activation_fn=self.activation_fn)(obs, action, zs, zsa)
 
 
+class SimbaTD7StateEncoder(nn.Module):
+    hidden_dim: int = 256
+    zs_dim: int = 256
+    num_layers: int = 3
+    activation_fn: Callable[[jnp.ndarray], jnp.ndarray] = nn.elu
+
+    @nn.compact
+    def __call__(self, obs: jnp.ndarray) -> jnp.ndarray:
+        x = Flatten()(obs)
+        for layer_idx in range(self.num_layers):
+            out_dim = self.hidden_dim if layer_idx < self.num_layers - 1 else self.zs_dim
+            x = nn.Dense(out_dim)(x)
+            if layer_idx < self.num_layers - 1:
+                x = self.activation_fn(x)
+        return avg_l1_norm(x)
+
+
+class SimbaTD7ActionEncoder(nn.Module):
+    hidden_dim: int = 256
+    zs_dim: int = 256
+    num_layers: int = 3
+    activation_fn: Callable[[jnp.ndarray], jnp.ndarray] = nn.elu
+
+    @nn.compact
+    def __call__(self, zs: jnp.ndarray, action: jnp.ndarray) -> jnp.ndarray:
+        x = jnp.concatenate([zs, action], axis=-1)
+        for layer_idx in range(self.num_layers):
+            out_dim = self.hidden_dim if layer_idx < self.num_layers - 1 else self.zs_dim
+            x = nn.Dense(out_dim)(x)
+            if layer_idx < self.num_layers - 1:
+                x = self.activation_fn(x)
+        return x
+
+
 class SimbaTD7Actor(nn.Module):
     action_dim: int
     hidden_dim: int = 256
@@ -346,8 +380,8 @@ class SimbaTD7Policy(TD7Policy):
         features_extractor_class=None,
         features_extractor_kwargs: dict[str, Any] | None = None,
         normalize_images: bool = True,
-        state_encoder_class: type[nn.Module] = StateEncoder,
-        action_encoder_class: type[nn.Module] = StateActionEncoder,
+        state_encoder_class: type[nn.Module] = SimbaTD7StateEncoder,
+        action_encoder_class: type[nn.Module] = SimbaTD7ActionEncoder,
         actor_class: type[nn.Module] = SimbaTD7Actor,
         critic_class: type[nn.Module] = SimbaTD7TwinCritic,
         state_encoder_kwargs: dict[str, Any] | None = None,

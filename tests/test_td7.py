@@ -11,7 +11,14 @@ from stable_baselines3.common.utils import ConstantSchedule
 
 from sbx import TD7
 from sbx.td7.replay_buffer import TD7ReplayBuffer
-from sbx.td7.policies import SimbaTD7Policy, TD7Policy
+from sbx.td7.policies import (
+    SimbaTD7ActionEncoder,
+    SimbaTD7Actor,
+    SimbaTD7Policy,
+    SimbaTD7TwinCritic,
+    SimbaTD7StateEncoder,
+    TD7Policy,
+)
 
 
 def test_td7_replay_buffer_add_and_sample():
@@ -94,6 +101,10 @@ def test_td7_exposes_simba_policy_alias():
     model = TD7("SimbaPolicy", "Pendulum-v1", learning_starts=10, buffer_size=512, batch_size=32)
 
     assert isinstance(model.policy, SimbaTD7Policy)
+    assert isinstance(model.policy.state_encoder, SimbaTD7StateEncoder)
+    assert isinstance(model.policy.action_encoder, SimbaTD7ActionEncoder)
+    assert isinstance(model.policy.actor, SimbaTD7Actor)
+    assert isinstance(model.policy.critic, SimbaTD7TwinCritic)
 
 
 def test_td7_train_step_updates_key_and_training_counters():
