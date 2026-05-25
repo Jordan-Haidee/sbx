@@ -1,3 +1,4 @@
+from copy import deepcopy
 from typing import Any, ClassVar
 
 import jax
@@ -161,38 +162,69 @@ class TD7(OffPolicyAlgorithmJax):
         reset_num_timesteps: bool = True,
         progress_bar: bool = False,
     ):
-        del callback, log_interval, tb_log_name, progress_bar
-        if reset_num_timesteps:
-            self.num_timesteps = 0
+        total_timesteps, callback = self._setup_learn(
+            total_timesteps=total_timesteps,
+            callback=callback,
+            reset_num_timesteps=reset_num_timesteps,
+            tb_log_name=tb_log_name,
+            progress_bar=progress_bar,
+        )
+        callback.on_training_start(locals(), globals())
 
-        obs = self.env.reset()
-        episode_return = 0.0
-        episode_length = 0
+        assert self.env is not None
+        assert self._last_obs is not None
+
+        episode_returns = np.zeros(self.env.num_envs, dtype=np.float32)
+        episode_lengths = np.zeros(self.env.num_envs, dtype=np.int32)
+        continue_training = True
+
+        callback.on_rollout_start()
 
         while self.num_timesteps < total_timesteps:
-            action = self._sample_td7_action(obs, deterministic=False, use_checkpoint=False)
-            env_action = self.policy.unscale_action(np.asarray(action))
-            next_obs, rewards, dones, _infos = self.env.step(env_action)
-            reward = float(rewards[0])
-            done = bool(dones[0])
+            actions = self._sample_td7_action(self._last_obs, deterministic=False, use_checkpoint=False)
+            env_actions = self.policy.unscale_action(np.asarray(actions))
+            new_obs, rewards, dones, infos = self.env.step(env_actions)
 
-            self.replay_buffer.add(
-                self._flatten_observation(obs[0] if isinstance(obs, np.ndarray) and obs.ndim > 1 else obs),
-                np.asarray(action[0], dtype=np.float32),
-                self._flatten_observation(next_obs[0] if isinstance(next_obs, np.ndarray) and next_obs.ndim > 1 else next_obs),
-                reward,
-                done,
-            )
+            self.num_timesteps += self.env.num_envs
+            episode_lengths += 1
+            episode_returns += rewards
+            self._last_episode_starts = dones
 
-            self.num_timesteps += 1
-            episode_length += 1
-            episode_return += reward
-            obs = next_obs
+            callback.update_locals(locals())
+            if not callback.on_step():
+                continue_training = False
+                break
 
-            if done:
+            self._update_info_buffer(infos, dones)
+            self._store_td7_transition(np.asarray(actions), new_obs, rewards, dones, infos)
+            self._update_current_progress_remaining(self.num_timesteps, self._total_timesteps)
+            self._on_step()
+
+            for idx, done in enumerate(dones):
+                if not done:
+                    continue
+
+                self._episode_num += 1
+                maybe_ep_info = infos[idx].get("episode")
+                episode_length = int(maybe_ep_info["l"]) if maybe_ep_info is not None else int(episode_lengths[idx])
+                episode_return = float(maybe_ep_info["r"]) if maybe_ep_info is not None else float(episode_returns[idx])
                 self._on_episode_end(episode_length, episode_return)
-                episode_length = 0
-                episode_return = 0.0
+                episode_lengths[idx] = 0
+                episode_returns[idx] = 0.0
+
+                if self.action_noise is not None:
+                    kwargs = dict(indices=[idx]) if self.env.num_envs > 1 else {}
+                    self.action_noise.reset(**kwargs)
+
+                if log_interval is not None and self._episode_num % log_interval == 0:
+                    self.dump_logs()
+
+        callback.on_rollout_end()
+
+        if continue_training and len(self.logger.name_to_value) > 0:
+            self.dump_logs()
+
+        callback.on_training_end()
 
         return self
 
@@ -219,6 +251,66 @@ class TD7(OffPolicyAlgorithmJax):
             keys = list(self.observation_space.spaces.keys())  # type: ignore[union-attr]
             return np.concatenate([np.asarray(observation[key], dtype=np.float32).reshape(-1) for key in keys], axis=0)
         return np.asarray(observation, dtype=np.float32).reshape(-1)
+
+    def _extract_env_observation(self, observation, env_idx: int):
+        if isinstance(observation, dict):
+            return {key: np.asarray(value[env_idx], dtype=np.float32) for key, value in observation.items()}
+
+        observation = np.asarray(observation, dtype=np.float32)
+        if observation.ndim > len(self.observation_space.shape):
+            return observation[env_idx]
+        return observation
+
+    def _store_td7_transition(
+        self,
+        buffer_actions: np.ndarray,
+        new_obs,
+        rewards: np.ndarray,
+        dones: np.ndarray,
+        infos: list[dict[str, Any]],
+    ) -> None:
+        assert isinstance(self.replay_buffer, TD7ReplayBuffer)
+        assert self._last_obs is not None
+
+        if self._vec_normalize_env is not None:
+            new_obs_ = self._vec_normalize_env.get_original_obs()
+            rewards_ = self._vec_normalize_env.get_original_reward()
+            last_original_obs = self._last_original_obs
+        else:
+            last_original_obs, new_obs_, rewards_ = self._last_obs, new_obs, rewards
+
+        next_obs = deepcopy(new_obs_)
+        for idx, done in enumerate(dones):
+            if not done or infos[idx].get("terminal_observation") is None:
+                continue
+
+            terminal_observation = infos[idx]["terminal_observation"]
+            if self._vec_normalize_env is not None:
+                terminal_observation = self._vec_normalize_env.unnormalize_obs(terminal_observation)
+
+            if isinstance(next_obs, dict):
+                for key in next_obs.keys():
+                    next_obs[key][idx] = terminal_observation[key]
+            else:
+                next_obs[idx] = terminal_observation
+
+        assert last_original_obs is not None
+
+        for idx in range(self.env.num_envs):
+            observation = self._flatten_observation(self._extract_env_observation(last_original_obs, idx))
+            next_observation = self._flatten_observation(self._extract_env_observation(next_obs, idx))
+            action = np.asarray(buffer_actions[idx], dtype=np.float32).reshape(-1)
+            self.replay_buffer.add(
+                observation,
+                action,
+                next_observation,
+                float(rewards_[idx]),
+                bool(dones[idx]),
+            )
+
+        self._last_obs = new_obs
+        if self._vec_normalize_env is not None:
+            self._last_original_obs = new_obs_
 
     def _sample_td7_action(self, observation, deterministic: bool = False, use_checkpoint: bool = False) -> np.ndarray:
         obs = np.asarray(observation, dtype=np.float32)
@@ -460,6 +552,12 @@ class TD7(OffPolicyAlgorithmJax):
         if self.replay_buffer.size < self.batch_size:
             return
 
+        self._maybe_reset_params()
+        encoder_loss_value = 0.0
+        critic_loss_value = 0.0
+        actor_loss_value = 0.0
+        priority_mean_value = 0.0
+
         for _ in range(steps_to_train):
             sample = self.replay_buffer.sample(self.batch_size)
             (
@@ -469,9 +567,9 @@ class TD7(OffPolicyAlgorithmJax):
                 self.policy.fixed_encoder_state,
                 self.policy.fixed_encoder_target_state,
                 priorities,
-                _encoder_loss,
-                _critic_loss,
-                _actor_loss,
+                encoder_loss,
+                critic_loss,
+                actor_loss,
                 self.target_min_value,
                 self.target_max_value,
                 self.running_min_value,
@@ -503,3 +601,18 @@ class TD7(OffPolicyAlgorithmJax):
             )
             self.replay_buffer.update_priorities(sample.indices, np.asarray(priorities))
             self._n_updates += 1
+            encoder_loss_value = float(encoder_loss)
+            critic_loss_value = float(critic_loss)
+            actor_loss_value = float(actor_loss)
+            priority_mean_value = float(np.mean(np.asarray(priorities)))
+
+        if hasattr(self, "_logger"):
+            self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
+            self.logger.record("train/encoder_loss", encoder_loss_value)
+            self.logger.record("train/critic_loss", critic_loss_value)
+            self.logger.record("train/actor_loss", actor_loss_value)
+            self.logger.record("train/priority_mean", priority_mean_value)
+            self.logger.record("train/target_min_value", float(self.target_min_value))
+            self.logger.record("train/target_max_value", float(self.target_max_value))
+            self.logger.record("train/running_min_value", float(self.running_min_value))
+            self.logger.record("train/running_max_value", float(self.running_max_value))

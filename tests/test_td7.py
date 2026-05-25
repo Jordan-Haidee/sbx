@@ -2,7 +2,10 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 import gymnasium as gym
+import pytest
 from gymnasium import spaces
+from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.logger import configure
 from stable_baselines3.common.utils import ConstantSchedule
 
 from sbx import TD7
@@ -97,6 +100,22 @@ class TinyEpisodeEnv(gym.Env):
         return np.zeros(3, dtype=np.float32), reward, terminated, False, {}
 
 
+class CountingCallback(BaseCallback):
+    def __init__(self):
+        super().__init__()
+        self.training_started = False
+        self.training_ended = False
+
+    def _on_training_start(self) -> None:
+        self.training_started = True
+
+    def _on_step(self) -> bool:
+        return True
+
+    def _on_training_end(self) -> None:
+        self.training_ended = True
+
+
 def test_td7_checkpoint_window_triggers_training_pulse():
     model = TD7(
         "MlpPolicy",
@@ -126,3 +145,58 @@ def test_td7_predict_uses_checkpoint_params_after_checkpointing():
     obs = np.zeros(3, dtype=np.float32)
     action, _ = model.predict(obs, deterministic=True)
     assert action.shape == (1,)
+
+
+def test_td7_learn_uses_callback_lifecycle():
+    model = TD7(
+        "MlpPolicy",
+        TinyEpisodeEnv(),
+        learning_starts=0,
+        buffer_size=128,
+        batch_size=8,
+        steps_before_checkpointing=2,
+        checkpoint_max_episodes=2,
+    )
+    callback = CountingCallback()
+    model.learn(total_timesteps=10, callback=callback, log_interval=1)
+
+    assert callback.training_started
+    assert callback.training_ended
+    assert callback.n_calls > 0
+
+
+def test_td7_logs_train_metrics_to_logger(tmp_path):
+    model = TD7(
+        "MlpPolicy",
+        TinyEpisodeEnv(),
+        learning_starts=0,
+        buffer_size=128,
+        batch_size=8,
+        steps_before_checkpointing=2,
+        checkpoint_max_episodes=2,
+    )
+    logger = configure(str(tmp_path), ["csv"])
+    model.set_logger(logger)
+    model.learn(total_timesteps=10, log_interval=1)
+    logger.close()
+
+    progress_csv = tmp_path / "progress.csv"
+    content = progress_csv.read_text(encoding="utf-8")
+
+    assert "train/encoder_loss" in content
+    assert "train/critic_loss" in content
+    assert "train/n_updates" in content
+
+
+def test_td7_learn_supports_progress_bar():
+    pytest.importorskip("tqdm.rich")
+    model = TD7(
+        "MlpPolicy",
+        TinyEpisodeEnv(),
+        learning_starts=0,
+        buffer_size=128,
+        batch_size=8,
+        steps_before_checkpointing=2,
+        checkpoint_max_episodes=2,
+    )
+    model.learn(total_timesteps=10, log_interval=1, progress_bar=True)
