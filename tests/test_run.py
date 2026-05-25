@@ -6,7 +6,28 @@ from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.envs import BitFlippingEnv
 from stable_baselines3.common.evaluation import evaluate_policy
 
-from sbx import DDPG, DQN, PPO, SAC, TD3, TQC, CrossQ, DroQ
+from sbx import DDPG, DQN, PPO, SAC, TD3, TQC, CrossQ, DroQ, TD7
+
+
+def test_td7_is_exported():
+    assert TD7 is not None
+
+
+def test_td7_can_initialize():
+    model = TD7("MlpPolicy", "Pendulum-v1", learning_starts=10, buffer_size=1000, batch_size=32)
+    assert model.policy is not None
+    assert model.action_space.shape == (1,)
+
+
+def test_td7_save_load_preserves_deterministic_prediction(tmp_path):
+    model = TD7("MlpPolicy", "Pendulum-v1", learning_starts=10, buffer_size=1000, batch_size=32)
+    model.learn(64)
+    obs = model.get_env().observation_space.sample()
+    action_before, _ = model.predict(obs, deterministic=True)
+    model.save(tmp_path / "td7_test.zip")
+    loaded = TD7.load(tmp_path / "td7_test.zip")
+    action_after, _ = loaded.predict(obs, deterministic=True)
+    assert np.allclose(action_before, action_after)
 
 
 def check_save_load(model, model_class, tmp_path):
