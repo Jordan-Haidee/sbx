@@ -136,24 +136,26 @@ class TD7(OffPolicyAlgorithmJax):
                 self.qf_learning_rate,
                 self.encoder_learning_rate,
             )
-            if not isinstance(self.observation_space, spaces.Dict):
-                obs_dim = int(np.sum(self.observation_space.shape))
-            else:
-                obs_dim = int(sum(np.prod(space.shape) for space in self.observation_space.spaces.values()))
-            action_dim = int(np.prod(self.action_space.shape))
-            self.replay_buffer = TD7ReplayBuffer(
-                buffer_size=self.buffer_size,
-                observation_dim=obs_dim,
-                action_dim=action_dim,
-                batch_size=self.batch_size,
-                alpha=self.prioritized_replay_alpha,
-            )
-            self.actor = self.policy.actor  # type: ignore[assignment]
-            self.critic = self.policy.critic  # type: ignore[assignment]
-            self.state_encoder = self.policy.state_encoder  # type: ignore[assignment]
-            self.action_encoder = self.policy.action_encoder  # type: ignore[assignment]
             self.checkpoint_actor_params = self.policy.checkpoint_actor_params
             self.checkpoint_encoder_params = self.policy.checkpoint_encoder_params
+
+        self.actor = self.policy.actor  # type: ignore[assignment]
+        self.critic = self.policy.critic  # type: ignore[assignment]
+        self.state_encoder = self.policy.state_encoder  # type: ignore[assignment]
+        self.action_encoder = self.policy.action_encoder  # type: ignore[assignment]
+
+        if not isinstance(self.observation_space, spaces.Dict):
+            obs_dim = int(np.sum(self.observation_space.shape))
+        else:
+            obs_dim = int(sum(np.prod(space.shape) for space in self.observation_space.spaces.values()))
+        action_dim = int(np.prod(self.action_space.shape))
+        self.replay_buffer = TD7ReplayBuffer(
+            buffer_size=self.buffer_size,
+            observation_dim=obs_dim,
+            action_dim=action_dim,
+            batch_size=self.batch_size,
+            alpha=self.prioritized_replay_alpha,
+        )
 
     def learn(
         self,

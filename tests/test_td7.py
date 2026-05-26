@@ -317,6 +317,25 @@ def test_td7_logs_train_metrics_to_logger(tmp_path):
     assert "train/n_updates" in content
 
 
+def test_td7_load_restores_td7_replay_buffer(tmp_path):
+    model = TD7(
+        "MlpPolicy",
+        TinyEpisodeEnv(),
+        learning_starts=0,
+        buffer_size=128,
+        batch_size=8,
+        steps_before_checkpointing=2,
+        checkpoint_max_episodes=2,
+    )
+    save_path = tmp_path / "td7_model"
+    model.save(save_path)
+
+    loaded = TD7.load(save_path, env=TinyEpisodeEnv())
+
+    assert isinstance(loaded.replay_buffer, TD7ReplayBuffer)
+    loaded.learn(total_timesteps=4)
+
+
 def test_td7_learn_supports_progress_bar():
     pytest.importorskip("tqdm.rich")
     model = TD7(
