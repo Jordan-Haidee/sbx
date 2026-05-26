@@ -235,6 +235,7 @@ class TD7(OffPolicyAlgorithmJax):
             self._store_td7_transition(np.asarray(actions), new_obs, rewards, dones, infos)
             self._update_current_progress_remaining(self.num_timesteps, self._total_timesteps)
             self._on_step()
+            should_dump_logs = False
 
             for idx, done in enumerate(dones):
                 if not done:
@@ -253,7 +254,10 @@ class TD7(OffPolicyAlgorithmJax):
                     self.action_noise.reset(**kwargs)
 
                 if log_interval is not None and self._episode_num % log_interval == 0:
-                    self.dump_logs()
+                    should_dump_logs = True
+
+            if should_dump_logs:
+                self.dump_logs()
 
         callback.on_rollout_end()
 
