@@ -1,3 +1,5 @@
+import io
+import pathlib
 from copy import deepcopy
 from typing import Any, ClassVar
 
@@ -117,6 +119,36 @@ class TD7(OffPolicyAlgorithmJax):
 
         if _init_setup_model:
             self._setup_model()
+
+    def _excluded_save_params(self) -> list[str]:
+        excluded = super()._excluded_save_params()
+        excluded.extend(["ep_info_buffer", "ep_success_buffer"])
+        return excluded
+
+    @classmethod
+    def load(
+        cls,
+        path: str | pathlib.Path | io.BufferedIOBase,
+        env: GymEnv | None = None,
+        device: str = "auto",
+        custom_objects: dict[str, Any] | None = None,
+        print_system_info: bool = False,
+        force_reset: bool = True,
+        **kwargs,
+    ):
+        model = super().load(
+            path,
+            env=env,
+            device=device,
+            custom_objects=custom_objects,
+            print_system_info=print_system_info,
+            force_reset=force_reset,
+            **kwargs,
+        )
+        # Episode stats are logging-only state and should not leak across checkpoint sessions.
+        model.ep_info_buffer = None
+        model.ep_success_buffer = None
+        return model
 
     def _setup_model(self) -> None:
         super()._setup_model()

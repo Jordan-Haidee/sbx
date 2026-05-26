@@ -4,6 +4,7 @@ import jax.numpy as jnp
 import gymnasium as gym
 import optax
 import pytest
+import csv
 from gymnasium import spaces
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.logger import configure
@@ -202,6 +203,20 @@ class TinyEpisodeEnv(gym.Env):
         return np.zeros(3, dtype=np.float32), reward, terminated, False, {}
 
 
+class FixedRewardEpisodeEnv(gym.Env):
+    def __init__(self, reward: float):
+        self.reward = reward
+        self.observation_space = gym.spaces.Box(-1.0, 1.0, shape=(3,))
+        self.action_space = gym.spaces.Box(-1.0, 1.0, shape=(1,))
+
+    def reset(self, *, seed=None, options=None):
+        super().reset(seed=seed)
+        return np.zeros(3, dtype=np.float32), {}
+
+    def step(self, action):
+        return np.zeros(3, dtype=np.float32), float(self.reward), True, False, {}
+
+
 class CountingCallback(BaseCallback):
     def __init__(self):
         super().__init__()
@@ -334,6 +349,30 @@ def test_td7_load_restores_td7_replay_buffer(tmp_path):
 
     assert isinstance(loaded.replay_buffer, TD7ReplayBuffer)
     loaded.learn(total_timesteps=4)
+
+
+def test_td7_load_resets_episode_logging_window_for_continued_training(tmp_path):
+    model = TD7(
+        "MlpPolicy",
+        FixedRewardEpisodeEnv(1.0),
+        learning_starts=0,
+        buffer_size=16,
+        batch_size=1,
+    )
+    save_path = tmp_path / "td7_model"
+    model.learn(total_timesteps=1, log_interval=1)
+    model.save(save_path)
+
+    loaded = TD7.load(save_path, env=FixedRewardEpisodeEnv(10.0))
+    logger = configure(str(tmp_path / "continued"), ["csv"])
+    loaded.set_logger(logger)
+    loaded.learn(total_timesteps=1, log_interval=1, reset_num_timesteps=False)
+    logger.close()
+
+    with (tmp_path / "continued" / "progress.csv").open(newline="", encoding="utf-8") as progress_file:
+        rows = list(csv.DictReader(progress_file))
+
+    assert float(rows[-1]["rollout/ep_rew_mean"]) == pytest.approx(10.0)
 
 
 def test_td7_learn_supports_progress_bar():
