@@ -14,6 +14,7 @@ from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedul
 from sbx.common.off_policy_algorithm import OffPolicyAlgorithmJax
 from sbx.td7.policies import SimbaTD7Policy, SimbaV2TD7Policy, TD7Policy
 from sbx.td7.replay_buffer import TD7ReplayBuffer
+from sbx.td7.utils import RunningMeanStd
 
 
 class TD7(OffPolicyAlgorithmJax):
@@ -116,6 +117,7 @@ class TD7(OffPolicyAlgorithmJax):
         self.max_episodes_before_update = 1
         self.checkpoint_actor_params = None
         self.checkpoint_encoder_params = None
+        self.use_simbav2_observation_normalization = False
 
         if _init_setup_model:
             self._setup_model()
@@ -175,6 +177,7 @@ class TD7(OffPolicyAlgorithmJax):
         self.critic = self.policy.critic  # type: ignore[assignment]
         self.state_encoder = self.policy.state_encoder  # type: ignore[assignment]
         self.action_encoder = self.policy.action_encoder  # type: ignore[assignment]
+        self.use_simbav2_observation_normalization = isinstance(self.policy, SimbaV2TD7Policy)
 
         if not isinstance(self.observation_space, spaces.Dict):
             obs_dim = int(np.sum(self.observation_space.shape))
@@ -188,6 +191,10 @@ class TD7(OffPolicyAlgorithmJax):
             batch_size=self.batch_size,
             alpha=self.prioritized_replay_alpha,
         )
+        if self.use_simbav2_observation_normalization and not hasattr(self, "obs_rms"):
+            self.obs_rms = RunningMeanStd(shapes=[(obs_dim,)], dtype=np.float64)
+            self.action_obs_rms = deepcopy(self.obs_rms)
+            self.checkpoint_obs_rms = deepcopy(self.obs_rms)
 
     def learn(
         self,
@@ -217,7 +224,12 @@ class TD7(OffPolicyAlgorithmJax):
         callback.on_rollout_start()
 
         while self.num_timesteps < total_timesteps:
-            actions = self._sample_td7_action(self._last_obs, deterministic=False, use_checkpoint=False)
+            actions = self._sample_td7_action(
+                self._last_obs,
+                deterministic=False,
+                use_checkpoint=False,
+                update_stats=True,
+            )
             env_actions = self.policy.unscale_action(np.asarray(actions))
             new_obs, rewards, dones, infos = self.env.step(env_actions)
 
@@ -352,10 +364,45 @@ class TD7(OffPolicyAlgorithmJax):
         if self._vec_normalize_env is not None:
             self._last_original_obs = new_obs_
 
-    def _sample_td7_action(self, observation, deterministic: bool = False, use_checkpoint: bool = False) -> np.ndarray:
+    def _normalize_td7_observations(
+        self,
+        observation,
+        *,
+        update_stats: bool = False,
+        use_checkpoint: bool = False,
+        use_action_stats: bool = False,
+    ) -> np.ndarray:
         obs = np.asarray(observation, dtype=np.float32)
         if obs.ndim == 1:
             obs = obs.reshape(1, -1)
+        if not self.use_simbav2_observation_normalization:
+            return obs
+
+        if update_stats:
+            self.obs_rms.update(obs)
+
+        if use_checkpoint and hasattr(self, "checkpoint_obs_rms"):
+            rms = self.checkpoint_obs_rms
+        elif use_action_stats and hasattr(self, "action_obs_rms"):
+            rms = self.action_obs_rms
+        else:
+            rms = self.obs_rms
+
+        return np.asarray(rms.normalize(obs), dtype=np.float32)
+
+    def _sample_td7_action(
+        self,
+        observation,
+        deterministic: bool = False,
+        use_checkpoint: bool = False,
+        update_stats: bool = False,
+    ) -> np.ndarray:
+        obs = self._normalize_td7_observations(
+            observation,
+            update_stats=update_stats,
+            use_checkpoint=use_checkpoint,
+            use_action_stats=True,
+        )
 
         if self.num_timesteps < self.learning_starts and not deterministic:
             scaled = np.array([self.action_space.sample() for _ in range(obs.shape[0])], dtype=np.float32)
@@ -389,6 +436,8 @@ class TD7(OffPolicyAlgorithmJax):
     def _update_checkpoint_snapshot(self) -> None:
         self.checkpoint_actor_params = self.policy.actor_state.params
         self.checkpoint_encoder_params = self.policy.fixed_encoder_state.params
+        if self.use_simbav2_observation_normalization:
+            self.checkpoint_obs_rms = deepcopy(getattr(self, "action_obs_rms", self.obs_rms))
 
     def _flush_training_window(self) -> None:
         self._run_delayed_training_pulse(self.timesteps_since_update)
@@ -425,7 +474,7 @@ class TD7(OffPolicyAlgorithmJax):
 
     @staticmethod
     def _actor_loss_from_q_values(q_values: jax.Array) -> jax.Array:
-        return -jnp.mean(jnp.mean(q_values, axis=0))
+        return -jnp.mean(jnp.min(q_values, axis=0))
 
     @staticmethod
     @jax.jit
@@ -605,17 +654,20 @@ class TD7(OffPolicyAlgorithmJax):
             return
         if not isinstance(self.replay_buffer, TD7ReplayBuffer):
             return
-        if self.replay_buffer.size < self.batch_size:
-            return
-
-        self._maybe_reset_params()
         encoder_loss_value = 0.0
         critic_loss_value = 0.0
         actor_loss_value = 0.0
         priority_mean_value = 0.0
 
+        if self.replay_buffer.size >= self.batch_size:
+            self._maybe_reset_params()
+
         for _ in range(steps_to_train):
+            if self.replay_buffer.size < self.batch_size:
+                break
             sample = self.replay_buffer.sample(self.batch_size)
+            observations = self._normalize_td7_observations(sample.observations)
+            next_observations = self._normalize_td7_observations(sample.next_observations)
             (
                 self.policy.actor_state,
                 self.policy.critic_state,
@@ -637,9 +689,9 @@ class TD7(OffPolicyAlgorithmJax):
                 self.policy.encoder_state,
                 self.policy.fixed_encoder_state,
                 self.policy.fixed_encoder_target_state,
-                jnp.asarray(sample.observations),
+                jnp.asarray(observations),
                 jnp.asarray(sample.actions),
-                jnp.asarray(sample.next_observations),
+                jnp.asarray(next_observations),
                 jnp.asarray(sample.rewards),
                 jnp.asarray(sample.dones),
                 self.gamma,
@@ -663,6 +715,9 @@ class TD7(OffPolicyAlgorithmJax):
             critic_loss_value = float(critic_loss)
             actor_loss_value = float(actor_loss)
             priority_mean_value = float(np.mean(np.asarray(priorities)))
+
+        if self.use_simbav2_observation_normalization:
+            self.action_obs_rms = deepcopy(self.obs_rms)
 
         if hasattr(self, "_logger"):
             self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")

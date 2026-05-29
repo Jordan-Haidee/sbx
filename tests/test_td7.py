@@ -26,6 +26,7 @@ from sbx.td7.policies import (
     SimbaTD7StateEncoder,
     TD7Policy,
 )
+from sbx.td7.utils import RunningMeanStd
 
 
 def test_td7_replay_buffer_add_and_sample():
@@ -62,7 +63,15 @@ def test_td7_replay_buffer_priority_update_changes_max_priority():
     assert buffer.max_priority >= 5.0
 
 
-def test_td7_actor_loss_uses_mean_across_critics():
+def _make_running_mean_std(mean: np.ndarray, var: np.ndarray, count: float = 100.0) -> RunningMeanStd:
+    rms = RunningMeanStd(shapes=[mean.shape], dtype=np.float64)
+    rms.means = [mean.astype(np.float64, copy=True)]
+    rms.vars = [var.astype(np.float64, copy=True)]
+    rms.count = count
+    return rms
+
+
+def test_td7_actor_loss_uses_min_across_critics():
     q_values = jnp.array(
         [
             [[1.0], [5.0]],
@@ -73,7 +82,7 @@ def test_td7_actor_loss_uses_mean_across_critics():
 
     loss = TD7._actor_loss_from_q_values(q_values)
 
-    assert loss == pytest.approx(-4.0)
+    assert loss == pytest.approx(-3.0)
 
 
 def test_td7_policy_builds_and_predicts_shapes():
@@ -133,6 +142,112 @@ def test_simba_v2_td7_policy_uses_explicit_preprocess_and_baseline_param_tree():
     assert "SimbaV2Head_0" in policy.actor_state.params["params"]
     assert "VmapSimbaV2TD7SingleCritic_0" in policy.critic_state.params["params"]
     assert "SimbaV2Head_0" in policy.critic_state.params["params"]["VmapSimbaV2TD7SingleCritic_0"]
+
+
+def test_simba_v2_td7_rollout_normalizes_observations_with_action_stats(monkeypatch):
+    model = TD7("SimbaV2Policy", TinyEpisodeEnv(), learning_starts=0, buffer_size=32, batch_size=8)
+    captured_obs = {}
+
+    def fake_select_action(actor_state, fixed_encoder_state, observations):
+        del actor_state, fixed_encoder_state
+        captured_obs["value"] = np.asarray(observations)
+        return jnp.zeros((observations.shape[0], model.action_space.shape[0]), dtype=jnp.float32)
+
+    monkeypatch.setattr(model.policy, "select_action", fake_select_action)
+    model.obs_rms = _make_running_mean_std(np.zeros(3), np.ones(3))
+    model.action_obs_rms = _make_running_mean_std(np.array([1.0, 2.0, 3.0]), np.array([4.0, 9.0, 16.0]))
+
+    model._sample_td7_action(np.array([[5.0, 8.0, 11.0]], dtype=np.float32), deterministic=True, update_stats=True)
+
+    np.testing.assert_allclose(captured_obs["value"], np.array([[2.0, 2.0, 2.0]], dtype=np.float32), atol=1e-6)
+    assert np.all(model.obs_rms.means[0] > 0.0)
+
+
+def test_simba_v2_td7_training_pulse_normalizes_replay_samples(monkeypatch):
+    model = TD7("SimbaV2Policy", TinyEpisodeEnv(), learning_starts=0, buffer_size=32, batch_size=1)
+    model.obs_rms = _make_running_mean_std(np.array([1.0, 2.0, 3.0]), np.array([4.0, 9.0, 16.0]))
+    model.replay_buffer.add(
+        np.array([5.0, 8.0, 11.0], dtype=np.float32),
+        np.zeros(1, dtype=np.float32),
+        np.array([9.0, 14.0, 19.0], dtype=np.float32),
+        1.0,
+        False,
+    )
+    captured_batch = {}
+
+    def fake_train_single_step(
+        actor_state,
+        critic_state,
+        encoder_state,
+        fixed_encoder_state,
+        fixed_encoder_target_state,
+        observations,
+        actions,
+        next_observations,
+        rewards,
+        dones,
+        gamma,
+        policy_delay,
+        target_update_interval,
+        target_policy_noise,
+        target_noise_clip,
+        min_priority,
+        target_min_value,
+        target_max_value,
+        running_min_value,
+        running_max_value,
+        update_index,
+        key,
+    ):
+        del actions, rewards, dones, gamma, policy_delay, target_update_interval
+        del target_policy_noise, target_noise_clip, min_priority, update_index
+        captured_batch["observations"] = np.asarray(observations)
+        captured_batch["next_observations"] = np.asarray(next_observations)
+        priorities = jnp.ones((observations.shape[0],), dtype=jnp.float32)
+        zero = jnp.array(0.0, dtype=jnp.float32)
+        return (
+            actor_state,
+            critic_state,
+            encoder_state,
+            fixed_encoder_state,
+            fixed_encoder_target_state,
+            priorities,
+            zero,
+            zero,
+            zero,
+            target_min_value,
+            target_max_value,
+            running_min_value,
+            running_max_value,
+            key,
+        )
+
+    monkeypatch.setattr(model, "_train_single_step", fake_train_single_step)
+
+    model._run_delayed_training_pulse(steps_to_train=1)
+
+    np.testing.assert_allclose(
+        captured_batch["observations"],
+        np.array([[2.0, 2.0, 2.0]], dtype=np.float32),
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        captured_batch["next_observations"],
+        np.array([[4.0, 4.0, 4.0]], dtype=np.float32),
+        atol=1e-6,
+    )
+    assert model.action_obs_rms is not model.obs_rms
+    np.testing.assert_allclose(model.action_obs_rms.means[0], model.obs_rms.means[0])
+
+
+def test_simba_v2_td7_checkpoint_snapshot_freezes_normalizer():
+    model = TD7("SimbaV2Policy", TinyEpisodeEnv(), learning_starts=0, buffer_size=32, batch_size=8)
+    model.action_obs_rms = _make_running_mean_std(np.array([1.0, 2.0, 3.0]), np.array([4.0, 9.0, 16.0]))
+
+    model._update_checkpoint_snapshot()
+
+    assert model.checkpoint_obs_rms is not model.action_obs_rms
+    np.testing.assert_allclose(model.checkpoint_obs_rms.means[0], model.action_obs_rms.means[0])
 
 
 def test_td7_exposes_simba_policy_alias():
