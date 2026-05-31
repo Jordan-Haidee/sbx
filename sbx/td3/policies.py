@@ -9,7 +9,8 @@ import optax
 from gymnasium import spaces
 from stable_baselines3.common.type_aliases import Schedule
 
-from sbx.common.policies import BaseJaxPolicy, Flatten, VectorCritic
+from sbx.common.simbav2_layers import SimbaV2DeterministicActor, SimbaV2TD3VectorCritic
+from sbx.common.policies import BaseJaxPolicy, Flatten, SimbaDeterministicActor, SimbaVectorCritic, VectorCritic
 from sbx.common.type_aliases import RLTrainState
 
 
@@ -47,6 +48,8 @@ class TD3Policy(BaseJaxPolicy):
         optimizer_kwargs: dict[str, Any] | None = None,
         n_critics: int = 2,
         share_features_extractor: bool = False,
+        actor_class: type[nn.Module] = Actor,
+        vector_critic_class: type[nn.Module] = VectorCritic,
     ):
         super().__init__(
             observation_space,
@@ -69,6 +72,8 @@ class TD3Policy(BaseJaxPolicy):
             self.net_arch_pi = self.net_arch_qf = [256, 256]
         self.n_critics = n_critics
         self.activation_fn = activation_fn
+        self.actor_class = actor_class
+        self.vector_critic_class = vector_critic_class
 
         self.key = self.noise_key = jax.random.PRNGKey(0)
 
@@ -83,30 +88,40 @@ class TD3Policy(BaseJaxPolicy):
             obs = jnp.array([self.observation_space.sample()])
         action = jnp.array([self.action_space.sample()])
 
-        self.actor = Actor(
+        self.actor = self.actor_class(
             action_dim=int(np.prod(self.action_space.shape)), net_arch=self.net_arch_pi, activation_fn=self.activation_fn
+        )
+        actor_apply_fn = jax.jit(self.actor.apply)
+        actor_optimizer = optax.inject_hyperparams(self.optimizer_class)(
+            learning_rate=lr_schedule(1),
+            **self.optimizer_kwargs,
         )
 
         self.actor_state = RLTrainState.create(
-            apply_fn=self.actor.apply,
+            apply_fn=actor_apply_fn,
             params=self.actor.init(actor_key, obs),
             target_params=self.actor.init(actor_key, obs),
-            tx=self.optimizer_class(
-                learning_rate=lr_schedule(1),  # type: ignore[call-arg]
-                **self.optimizer_kwargs,
-            ),
+            tx=actor_optimizer,
         )
 
-        self.qf = VectorCritic(
+        self.qf = self.vector_critic_class(
             dropout_rate=self.dropout_rate,
             use_layer_norm=self.layer_norm,
             net_arch=self.net_arch_qf,
             n_critics=self.n_critics,
             activation_fn=self.activation_fn,
         )
+        qf_apply_fn = jax.jit(
+            self.qf.apply,
+            static_argnames=("dropout_rate", "use_layer_norm"),
+        )
+        qf_optimizer = optax.inject_hyperparams(self.optimizer_class)(
+            learning_rate=qf_learning_rate,
+            **self.optimizer_kwargs,
+        )
 
         self.qf_state = RLTrainState.create(
-            apply_fn=self.qf.apply,
+            apply_fn=qf_apply_fn,
             params=self.qf.init(
                 {"params": qf_key, "dropout": dropout_key},
                 obs,
@@ -117,17 +132,11 @@ class TD3Policy(BaseJaxPolicy):
                 obs,
                 action,
             ),
-            tx=self.optimizer_class(
-                learning_rate=qf_learning_rate,  # type: ignore[call-arg]
-                **self.optimizer_kwargs,
-            ),
+            tx=qf_optimizer,
         )
 
-        self.actor.apply = jax.jit(self.actor.apply)  # type: ignore[method-assign]
-        self.qf.apply = jax.jit(  # type: ignore[method-assign]
-            self.qf.apply,
-            static_argnames=("dropout_rate", "use_layer_norm"),
-        )
+        self.actor.apply = actor_apply_fn  # type: ignore[method-assign]
+        self.qf.apply = qf_apply_fn  # type: ignore[method-assign]
 
         return key
 
@@ -142,3 +151,87 @@ class TD3Policy(BaseJaxPolicy):
     def _predict(self, observation: np.ndarray, deterministic: bool = True) -> np.ndarray:  # type: ignore[override]
         # TD3 is always deterministic
         return TD3Policy.select_action(self.actor_state, observation)
+
+
+class SimbaTD3Policy(TD3Policy):
+    def __init__(
+        self,
+        observation_space: spaces.Space,
+        action_space: spaces.Box,
+        lr_schedule: Schedule,
+        net_arch: list[int] | dict[str, list[int]] | None = None,
+        dropout_rate: float = 0.0,
+        layer_norm: bool = False,
+        activation_fn: Callable[[jnp.ndarray], jnp.ndarray] = nn.relu,
+        use_sde: bool = False,
+        features_extractor_class=None,
+        features_extractor_kwargs: dict[str, Any] | None = None,
+        normalize_images: bool = True,
+        optimizer_class: Callable[..., optax.GradientTransformation] = optax.adamw,
+        optimizer_kwargs: dict[str, Any] | None = None,
+        n_critics: int = 2,
+        share_features_extractor: bool = False,
+        actor_class: type[nn.Module] = SimbaDeterministicActor,
+        vector_critic_class: type[nn.Module] = SimbaVectorCritic,
+    ):
+        super().__init__(
+            observation_space,
+            action_space,
+            lr_schedule,
+            net_arch,
+            dropout_rate,
+            layer_norm,
+            activation_fn,
+            use_sde,
+            features_extractor_class,
+            features_extractor_kwargs,
+            normalize_images,
+            optimizer_class,
+            optimizer_kwargs,
+            n_critics,
+            share_features_extractor,
+            actor_class,
+            vector_critic_class,
+        )
+
+
+class SimbaV2TD3Policy(TD3Policy):
+    def __init__(
+        self,
+        observation_space: spaces.Space,
+        action_space: spaces.Box,
+        lr_schedule: Schedule,
+        net_arch: list[int] | dict[str, list[int]] | None = None,
+        dropout_rate: float = 0.0,
+        layer_norm: bool = False,
+        activation_fn: Callable[[jnp.ndarray], jnp.ndarray] = nn.relu,
+        use_sde: bool = False,
+        features_extractor_class=None,
+        features_extractor_kwargs: dict[str, Any] | None = None,
+        normalize_images: bool = True,
+        optimizer_class: Callable[..., optax.GradientTransformation] = optax.adamw,
+        optimizer_kwargs: dict[str, Any] | None = None,
+        n_critics: int = 2,
+        share_features_extractor: bool = False,
+        actor_class: type[nn.Module] = SimbaV2DeterministicActor,
+        vector_critic_class: type[nn.Module] = SimbaV2TD3VectorCritic,
+    ):
+        super().__init__(
+            observation_space,
+            action_space,
+            lr_schedule,
+            net_arch,
+            dropout_rate,
+            layer_norm,
+            activation_fn,
+            use_sde,
+            features_extractor_class,
+            features_extractor_kwargs,
+            normalize_images,
+            optimizer_class,
+            optimizer_kwargs,
+            n_critics,
+            share_features_extractor,
+            actor_class,
+            vector_critic_class,
+        )

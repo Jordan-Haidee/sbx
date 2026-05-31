@@ -294,3 +294,20 @@ class SimbaSquashedGaussianActor(nn.Module):
             tfd.MultivariateNormalDiag(loc=mean, scale_diag=jnp.exp(log_std)),
         )
         return dist
+
+
+class SimbaDeterministicActor(nn.Module):
+    # Note: each element in net_arch corresponds to a residual block
+    net_arch: Sequence[int]
+    action_dim: int
+    activation_fn: Callable[[jnp.ndarray], jnp.ndarray] = nn.relu
+    scale_factor: int = 4
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        x = Flatten()(x)
+        x = nn.Dense(self.net_arch[0])(x)
+        for n_units in self.net_arch:
+            x = SimbaResidualBlock(n_units, self.activation_fn, self.scale_factor)(x)
+        x = nn.LayerNorm()(x)
+        return nn.tanh(nn.Dense(self.action_dim)(x))
