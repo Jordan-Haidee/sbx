@@ -25,6 +25,20 @@ class TD7PreProcess(nn.Module):
         return Flatten()(obs)
 
 
+def td7_linear(x: jnp.ndarray, features: int) -> jnp.ndarray:
+    """Use the author's nn.Linear initialization for the MLP networks."""
+    bound = float(x.shape[-1]) ** -0.5
+
+    def bias_init(key, shape, dtype=jnp.float32):
+        return jax.random.uniform(key, shape, dtype, minval=-bound, maxval=bound)
+
+    return nn.Dense(
+        features,
+        kernel_init=nn.initializers.variance_scaling(1 / 3, "fan_in", "uniform"),
+        bias_init=bias_init,
+    )(x)
+
+
 class StateEncoder(nn.Module):
     hidden_dim: int = 256
     zs_dim: int = 256
@@ -32,9 +46,9 @@ class StateEncoder(nn.Module):
 
     @nn.compact
     def __call__(self, feature: jnp.ndarray) -> jnp.ndarray:
-        x = self.activation_fn(nn.Dense(self.hidden_dim)(feature))
-        x = self.activation_fn(nn.Dense(self.hidden_dim)(x))
-        return avg_l1_norm(nn.Dense(self.zs_dim)(x))
+        x = self.activation_fn(td7_linear(feature, self.hidden_dim))
+        x = self.activation_fn(td7_linear(x, self.hidden_dim))
+        return avg_l1_norm(td7_linear(x, self.zs_dim))
 
 
 class StateActionEncoder(nn.Module):
@@ -45,9 +59,9 @@ class StateActionEncoder(nn.Module):
     @nn.compact
     def __call__(self, zs: jnp.ndarray, action: jnp.ndarray) -> jnp.ndarray:
         x = jnp.concatenate([zs, action], axis=-1)
-        x = self.activation_fn(nn.Dense(self.hidden_dim)(x))
-        x = self.activation_fn(nn.Dense(self.hidden_dim)(x))
-        return nn.Dense(self.zs_dim)(x)
+        x = self.activation_fn(td7_linear(x, self.hidden_dim))
+        x = self.activation_fn(td7_linear(x, self.hidden_dim))
+        return td7_linear(x, self.zs_dim)
 
 
 class TD7Actor(nn.Module):
@@ -57,11 +71,11 @@ class TD7Actor(nn.Module):
 
     @nn.compact
     def __call__(self, feature: jnp.ndarray, zs: jnp.ndarray) -> jnp.ndarray:
-        x = avg_l1_norm(nn.Dense(self.hidden_dim)(feature))
+        x = avg_l1_norm(td7_linear(feature, self.hidden_dim))
         x = jnp.concatenate([x, zs], axis=-1)
-        x = self.activation_fn(nn.Dense(self.hidden_dim)(x))
-        x = self.activation_fn(nn.Dense(self.hidden_dim)(x))
-        return nn.tanh(nn.Dense(self.action_dim)(x))
+        x = self.activation_fn(td7_linear(x, self.hidden_dim))
+        x = self.activation_fn(td7_linear(x, self.hidden_dim))
+        return nn.tanh(td7_linear(x, self.action_dim))
 
 
 class TD7SingleCritic(nn.Module):
@@ -71,11 +85,11 @@ class TD7SingleCritic(nn.Module):
     @nn.compact
     def __call__(self, feature: jnp.ndarray, action: jnp.ndarray, zs: jnp.ndarray, zsa: jnp.ndarray) -> jnp.ndarray:
         sa = jnp.concatenate([feature, action], axis=-1)
-        sa = avg_l1_norm(nn.Dense(self.hidden_dim)(sa))
-        x = jnp.concatenate([sa, zs, zsa], axis=-1)
-        x = self.activation_fn(nn.Dense(self.hidden_dim)(x))
-        x = self.activation_fn(nn.Dense(self.hidden_dim)(x))
-        return nn.Dense(1)(x)
+        sa = avg_l1_norm(td7_linear(sa, self.hidden_dim))
+        x = jnp.concatenate([sa, zsa, zs], axis=-1)
+        x = self.activation_fn(td7_linear(x, self.hidden_dim))
+        x = self.activation_fn(td7_linear(x, self.hidden_dim))
+        return td7_linear(x, 1)
 
 
 class TD7TwinCritic(nn.Module):

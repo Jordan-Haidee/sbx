@@ -1,6 +1,7 @@
 import io
 import pathlib
 from copy import deepcopy
+from functools import partial
 from typing import Any, ClassVar
 
 import jax
@@ -12,7 +13,7 @@ from stable_baselines3.common.noise import ActionNoise
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
 
 from sbx.common.off_policy_algorithm import OffPolicyAlgorithmJax
-from sbx.td7.policies import SimbaTD7Policy, SimbaV2TD7Policy, TD7Policy
+from sbx.td7.policies import SimbaTD7Policy, SimbaV2TD7Policy, TD7Actor, TD7Policy
 from sbx.td7.replay_buffer import TD7ReplayBuffer
 
 
@@ -119,6 +120,9 @@ class TD7(OffPolicyAlgorithmJax):
 
         if _init_setup_model:
             self._setup_model()
+            if self.policy.actor_class is TD7Actor:
+                self.running_min_value = jnp.array(1e8)
+                self.running_max_value = jnp.array(-1e8)
 
     def _excluded_save_params(self) -> list[str]:
         excluded = super()._excluded_save_params()
@@ -424,11 +428,17 @@ class TD7(OffPolicyAlgorithmJax):
         return 0.5 * quadratic**2 + delta * linear
 
     @staticmethod
+    def _lap_huber_loss(errors: jax.Array, delta: float = 1.0) -> jax.Array:
+        abs_errors = jnp.abs(errors)
+        # Match the author's LAP_huber, including its linear branch.
+        return jnp.where(abs_errors < delta, 0.5 * abs_errors**2, delta * abs_errors)
+
+    @staticmethod
     def _actor_loss_from_q_values(q_values: jax.Array) -> jax.Array:
         return -jnp.mean(jnp.mean(q_values, axis=0))
 
     @staticmethod
-    @jax.jit
+    @partial(jax.jit, static_argnames=("align_mlp",))
     def _train_single_step(
         actor_state,
         critic_state,
@@ -452,6 +462,7 @@ class TD7(OffPolicyAlgorithmJax):
         running_max_value,
         update_index: int,
         key,
+        align_mlp: bool = True,
     ):
         key, noise_key = jax.random.split(key)
 
@@ -503,7 +514,8 @@ class TD7(OffPolicyAlgorithmJax):
         def critic_loss_fn(params):
             current_q = critic_state.apply_fn(params, feature, actions, fixed_zs, fixed_zsa).squeeze(-1)
             td_errors = current_q - target_q[None, :]
-            loss = jnp.mean(TD7._huber_loss(td_errors).sum(axis=0))
+            huber_loss = TD7._lap_huber_loss if align_mlp else TD7._huber_loss
+            loss = jnp.mean(huber_loss(td_errors).sum(axis=0))
             priorities = jnp.maximum(jnp.max(jnp.abs(td_errors), axis=0), min_priority)
             return loss, priorities
 
@@ -533,7 +545,7 @@ class TD7(OffPolicyAlgorithmJax):
             return actor_state_, critic_state_, key_, jnp.array(0.0)
 
         actor_state, critic_state, key, actor_loss = jax.lax.cond(
-            update_index % policy_delay == 0,
+            ((update_index + 1) if align_mlp else update_index) % policy_delay == 0,
             actor_update_fn,
             actor_skip_fn,
             (actor_state, critic_state, key),
@@ -605,7 +617,8 @@ class TD7(OffPolicyAlgorithmJax):
             return
         if not isinstance(self.replay_buffer, TD7ReplayBuffer):
             return
-        if self.replay_buffer.size < self.batch_size:
+        align_mlp = self.policy.actor_class is TD7Actor
+        if self.replay_buffer.size < (1 if align_mlp else self.batch_size):
             return
 
         self._maybe_reset_params()
@@ -654,6 +667,7 @@ class TD7(OffPolicyAlgorithmJax):
                 self.running_max_value,
                 self._n_updates,
                 self.key,
+                align_mlp=align_mlp,
             )
             self.replay_buffer.update_priorities(sample.indices, np.asarray(priorities))
             if (self._n_updates + 1) % self.target_update_interval == 0:
